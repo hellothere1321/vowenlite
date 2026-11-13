@@ -1,0 +1,13 @@
+bin/
+obj/
+out/
+# whisper models are large downloads (ggml-base.en, ggml-small.en, silero VAD); keep them locally in vendor\models
+vendor/models/
+*.user
+.vs/
+# separate git repo of its own
+site/
+# agent notes stay local
+AGENTS.md
+CLAUDE.md
+docs/handoff-*.md
