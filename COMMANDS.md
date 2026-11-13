@@ -141,3 +141,17 @@ Say "Luna, ..." or "Jarvis, ..." with Right Shift, or hold Right Ctrl / Right Al
 **Planner**: "plan my day" lays today's due / high-priority tasks into the free time around your calendar (free); "block it in" books them as Focus events. In the meeting window's Ask AI panel, "Add to planner" turns an answer's bullets into tasks.
 
 **Ask AI (meeting window)**: starter buttons, This meeting / All meetings switch, answers kept per meeting (`ask.json`), Copy / Ask again / Clear / Hide, Stop while it thinks, Up arrow recalls your last question.
+
+## Typing to Luna, replies, background browser and passwords
+
+**Text box**: double-tap Right Ctrl (or press the Copilot key) to open the ask box; Enter sends, Esc closes. Holding Right Ctrl still means talk. Setting `AskDoubleTap` (default on) turns the double-tap off.
+
+**Replies**: every answer box has a Reply row. Type there, or open the ask box while it shows "continuing: ..." and your message carries on the same conversation. Press Tab in the ask box to start a new conversation instead. A conversation can be continued for 24 hours; the last 8 are kept (`threads.json`).
+
+**Background browser** (setting `WebBrowser`, default on): when a request needs a website, Luna works in a hidden browser of its own, so nothing opens on your screen and your own browser is untouched. It can open pages, read, click, type, scroll and take screenshots. It cannot reach this PC or your home network, cannot read cookies, will not type card details and will not press a final Pay / Buy / Send / Delete. It closes itself after about 3 idle minutes.
+
+**Passwords**: say "open passwords" to open the vault. Save the address of the site's sign-in page (for Google that is accounts.google.com, not google.com), the username and the password.
+- Luna signs in by asking the vault to fill the page. The password is typed in by the app itself; Luna never sees it, and it is removed from anything Luna reads back.
+- A saved login only fills on the exact site you saved it for, over https.
+- Every saved login lasts 7 days at most. After that the password is erased and the browser's sign-ins are wiped; it only works again when you type the password into the vault yourself.
+- A verification code, CAPTCHA or passkey prompt stops the sign-in and Luna tells you it needs you.

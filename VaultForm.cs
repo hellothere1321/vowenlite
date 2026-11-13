@@ -33,7 +33,7 @@ sealed class VaultForm : Form
         try { Icon = Theme.AppIcon(); } catch { }
         title.Font = Theme.Font(Theme.Display, 20f);
         sub.Font = status.Font = Theme.Font(Theme.Body, 9.5f);
-        string[] names = { "Site (e.g. github.com)", "Username or email", "Password" };
+        string[] names = { "Sign-in page's site (github.com, accounts.google.com)", "Username or email", "Password" };
         TextBox[] boxes = { site, user, pass };
         for (int i = 0; i < 3; i++)
         {

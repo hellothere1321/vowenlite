@@ -14,6 +14,7 @@ static class WebTest
         if (Environment.GetEnvironmentVariable("VOWENLITE_DATA") == null) { Console.WriteLine("set VOWENLITE_DATA to a scratch folder first"); return 2; }
         string dir = Directory.CreateDirectory(Path.Combine(Paths.DataDir, "webtest-site")).FullName;
         WritePages(dir);
+        Environment.SetEnvironmentVariable("VOWENLITE_WEBTEST", "1");       // arms the test-folder host mapping (off in production)
         Environment.SetEnvironmentVariable("VOWENLITE_WEB_TESTDIR", dir);   // inherited by the host this process starts
         int fail = 0;
         var outs = new List<string>();
@@ -21,7 +22,7 @@ static class WebTest
         void Check(string name, bool ok, string o = null) { Console.WriteLine((ok ? "PASS " : "FAIL ") + name); if (!ok) { fail++; if (o != null) Console.WriteLine("   got: " + o.Replace("\n", "\n   ")); } }
         static string Ref(string read, string pattern) { var m = Regex.Match(read, @"^\[(\d+)\][^\n]*" + pattern, RegexOptions.Multiline | RegexOptions.IgnoreCase); return m.Success ? m.Groups[1].Value : "0"; }
 
-        Vault.Save("vltest.example", User, Pw);
+        Vault.Save("login.vltest.example", User, Pw);
         string o = Do("open", "https://login.vltest.example/index.html");
         Check("open + read the sign-in page", o.StartsWith("exit 0") && o.Contains("Sign in") && o.Contains("(password field, empty)"), o);
         Check("type into a password field is refused", Do("type", Ref(o, "password field"), "hunter2").Contains("Use `login`"));
@@ -43,7 +44,7 @@ static class WebTest
         o = Do("open", "https://vltest.example.evil.example/index.html");
         Check("look-alike page opens", o.StartsWith("exit 0"), o);
         o = Do("login", "vltest.example");
-        Check("login for vltest.example refused on the look-alike", o.StartsWith("exit 126") && o.Contains("not an https page on vltest.example"), o);
+        Check("login for vltest.example refused on the look-alike", o.StartsWith("exit 126") && o.Contains("not an https page on login.vltest.example"), o);
         o = Do("login");
         Check("look-alike has no saved login", o.StartsWith("exit 3") && o.Contains("no saved login for evil.example"), o);
 
@@ -68,7 +69,7 @@ static class WebTest
         o = Do("open", "https://login.vltest.example/welcome.html");
         Check("session cookie present before expiry", o.Contains("cookie: sess=vl"), o);
         var real = Vault.Now; Vault.Now = () => DateTime.UtcNow - TimeSpan.FromDays(8);
-        Vault.Save("vltest.example", User, Pw);
+        Vault.Save("login.vltest.example", User, Pw);
         Vault.Now = real;
         Do("open", "https://login.vltest.example/index.html");
         o = Do("login");

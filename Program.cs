@@ -16,6 +16,7 @@ static class Program
     {
         if (args.Contains("--watch")) return Watcher.Run();
         if (args.Contains("--daemon")) return Daemon.Run(args);
+        if (args.Length == 2 && args[0] == "--say") return Assistant.SayMain(args[1]);
         if (args.Contains("--selftest")) return SelfTest.Run();
         if (args.Contains("--plantest")) return PlanTest.Run();
         if (args.Contains("--taptest")) return TapDetector.Test();
@@ -168,6 +169,10 @@ static class Daemon
         if (w >= 0 && w + 1 < args.Length) int.TryParse(args[w + 1], out watcherPid);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => Log("CRASH " + e.ExceptionObject);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Log("daemon exit");
+        Environment.SetEnvironmentVariable("DOTNET_GCgen0size", null);   // set by the watcher for this process only; helper windows we start keep the default
+        TrimLog();
+        // Diagnostic: the daemon is meant to stay WinForms-free (~13 MB); record who loads it if that ever happens.
+        AppDomain.CurrentDomain.AssemblyLoad += (_, e) => { if (e.LoadedAssembly.GetName().Name == "System.Windows.Forms") Log("WinForms loaded in daemon by: " + new StackTrace(true)); };
 
         // Hotkey bound to the thread (hWnd = 0): WM_HOTKEY lands in this thread's queue.
         string label = "Ctrl+`";
@@ -183,6 +188,7 @@ static class Daemon
             new Thread(() => Native.MessageBox(IntPtr.Zero, "Ctrl+` is taken by another app, so VowenLite uses Ctrl+Alt+` instead.", "VowenLite", 0x40)) { IsBackground = true }.Start();
         }
         Jobs.Init();
+        Paths.SecureKnown();   // keep the Codex sandbox account out of the vault, browser profile, Google tokens and the log
         Native.SetProcessDpiAwarenessContext((IntPtr)(-4)); // per-monitor v2: crisp overlay
         Overlay.Create();
         Assistant.Restore();   // reminders set before the last restart
@@ -230,12 +236,27 @@ static class Daemon
         foreach (var p in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(Environment.ProcessPath)))
         {
             // The daemon is single-instance (mutex), so apart from the watcher any other VowenLite.exe is the app.
-            if (p.Id == self || p.Id == watcherPid) { p.Dispose(); continue; }
+            if (p.Id == self || p.Id == watcherPid || p.Id == Assistant.SayPid) { p.Dispose(); continue; }
             list.Add(p);
         }
         return list;
     }
 
+    // daemon.log only ever grew: keep the last ~200 KB once it passes 400 KB.
+    static void TrimLog()
+    {
+        try
+        {
+            string path = Path.Combine(Paths.DataDir, "daemon.log");
+            var fi = new FileInfo(path);
+            if (!fi.Exists || fi.Length < 400_000) return;
+            var bytes = File.ReadAllBytes(path);
+            int from = bytes.Length - 200_000;
+            while (from < bytes.Length && bytes[from] != (byte)'\n') from++;   // start on a line boundary
+            File.WriteAllBytes(path, bytes[Math.Min(from + 1, bytes.Length)..]);
+        }
+        catch { }
+    }
     static void Log(string s)
     {
         try { File.AppendAllText(Path.Combine(Paths.DataDir, "daemon.log"), DateTime.Now.ToString("s") + " " + s + Environment.NewLine); } catch { }

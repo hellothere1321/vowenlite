@@ -1,3 +1,5 @@
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 
 namespace VowenLite;
@@ -11,6 +13,57 @@ static class Paths
     public static string MeetingsDir => Ensure(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "VowenLite", "Meetings"));
 
     static string Ensure(string dir) { Directory.CreateDirectory(dir); return dir; }
+
+    // C1: the sandboxed Codex account (CodexSandboxUsers) inherits Modify on the whole profile tree, so by default it can read
+    // vault.json, the browser profile (cookies = live sessions), the Google tokens and daemon.log. We clamp the sensitive files to
+    // a non-inherited DACL of {current user, SYSTEM, Administrators} only. The luna\ subfolder is deliberately NOT clamped: the
+    // sandbox legitimately works there. Idempotent and best-effort (a failure just leaves the inherited ACL).
+    static readonly string[] SecretFiles = { "vault.json", "browser-sites.json", "google-token.json", "google-client.json", "daemon.log" };
+    public static readonly string ProfileDir = Path.Combine(DataDir, "browser-profile");
+
+    static SecurityIdentifier Me => WindowsIdentity.GetCurrent().User;
+    static readonly SecurityIdentifier Sys = new(WellKnownSidType.LocalSystemSid, null);
+    static readonly SecurityIdentifier Admins = new(WellKnownSidType.BuiltinAdministratorsSid, null);
+
+    static void AddOwners<T>(T rules) where T : FileSystemSecurity
+    {
+        InheritanceFlags inh = rules is DirectorySecurity ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit : InheritanceFlags.None;
+        foreach (var sid in new[] { Me, Sys, Admins })
+            rules.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, inh, PropagationFlags.None, AccessControlType.Allow));
+    }
+
+    // Lock one path (file or directory) to the three trusted principals, inheritance disabled. Creates an empty file first so the
+    // DACL is in place before anything writes secrets into it; for the browser profile, call this BEFORE WebView2 populates it.
+    public static void Secure(string path, bool dir)
+    {
+        try
+        {
+            if (dir) Directory.CreateDirectory(path);
+            else if (!File.Exists(path)) File.WriteAllText(path, "");
+            if (dir)
+            {
+                var sec = new DirectorySecurity();
+                sec.SetAccessRuleProtection(true, false);   // drop inherited rules
+                AddOwners(sec);
+                new DirectoryInfo(path).SetAccessControl(sec);
+            }
+            else
+            {
+                var sec = new FileSecurity();
+                sec.SetAccessRuleProtection(true, false);
+                AddOwners(sec);
+                new FileInfo(path).SetAccessControl(sec);
+            }
+        }
+        catch { }
+    }
+
+    // Clamp every known secret that already exists (plus the browser profile). Safe to call repeatedly; call at daemon and web-host start.
+    public static void SecureKnown()
+    {
+        foreach (var f in SecretFiles) { string p = Path.Combine(DataDir, f); if (File.Exists(p)) Secure(p, false); }
+        if (Directory.Exists(ProfileDir)) Secure(ProfileDir, true);
+    }
 }
 
 class Settings

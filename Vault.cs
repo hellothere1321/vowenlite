@@ -21,11 +21,12 @@ static class Vault
 
     public sealed class Entry
     {
-        public string Site { get; set; } = "";
+        public string Site { get; set; } = "";     // registrable domain (coarse key for cookies/expiry grouping)
+        public string Host { get; set; } = "";      // the exact host the user typed (H2: logins only fill on this host + its www/bare pair)
         public string User { get; set; } = "";
-        public string Blob { get; set; }           // DPAPI ciphertext (base64); null once expired
+        public string Blob { get; set; }           // DPAPI ciphertext (base64) of "v1|<savedAtTicks>|<password>"; null once expired
         public string Salt { get; set; }           // per-entry entropy (base64)
-        public DateTime SavedAt { get; set; }      // UTC
+        public DateTime SavedAt { get; set; }      // UTC; display/ordering hint only. Authoritative expiry = the SavedAt sealed INSIDE Blob.
         public bool Expired => Blob == null;
         public double DaysLeft => Expired ? 0 : Math.Max(0, (SavedAt + Life - Now()).TotalDays);
     }
@@ -60,8 +61,8 @@ static class Vault
     static List<Entry> LoadEntries() { try { return File.Exists(VaultFile) ? JsonSerializer.Deserialize<List<Entry>>(File.ReadAllText(VaultFile)) ?? new() : new(); } catch { return new(); } }
     static Book LoadBook() { try { return File.Exists(BookFile) ? JsonSerializer.Deserialize<Book>(File.ReadAllText(BookFile)) ?? new() : new(); } catch { return new(); } }
     static void Atomic(string path, string text) { string tmp = path + ".tmp"; File.WriteAllText(tmp, text); File.Move(tmp, path, true); }
-    static void SaveEntries(List<Entry> e) => Atomic(VaultFile, JsonSerializer.Serialize(e, Opts));
-    static void SaveBook(Book b) => Atomic(BookFile, JsonSerializer.Serialize(b, Opts));
+    static void SaveEntries(List<Entry> e) { Atomic(VaultFile, JsonSerializer.Serialize(e, Opts)); Paths.Secure(VaultFile, false); }   // C1: keep the sandbox out
+    static void SaveBook(Book b) { Atomic(BookFile, JsonSerializer.Serialize(b, Opts)); Paths.Secure(BookFile, false); }
 
     // ---- registrable domain ("login.github.com" -> "github.com"; "a.b.co.uk" -> "b.co.uk"; "me.github.io" -> "me.github.io")
     static readonly HashSet<string> PublicSuffix2 = new(StringComparer.OrdinalIgnoreCase)
@@ -98,6 +99,41 @@ static class Vault
         return Site(u.Host) == site;
     }
 
+    // Exact host of a URL (lowercased, bracket/port/userinfo stripped), or "" if it isn't a parseable https(ish) URL/host.
+    public static string HostOf(string urlOrHost)
+    {
+        string h = (urlOrHost ?? "").Trim();
+        if (h.Length == 0) return "";
+        try
+        {
+            if (h.Contains("://")) h = new Uri(h).Host;
+            else { int cut = h.IndexOfAny(new[] { '/', '?', '#' }); if (cut >= 0) h = h.Substring(0, cut); int at = h.LastIndexOf('@'); if (at >= 0) h = h.Substring(at + 1); int colon = h.LastIndexOf(':'); if (colon > 0 && !h.Contains(']')) h = h.Substring(0, colon); }
+            h = h.Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+            if (!IPAddress.TryParse(h, out _)) h = new IdnMapping().GetAscii(h);
+        }
+        catch { return ""; }
+        return h;
+    }
+
+    // H2: the exact hosts a saved entry may fill on — the host the user typed, plus its explicit www<->bare counterpart. Nothing else:
+    // a "github.com" entry never fills on gist.github.com, user-content subdomains, or look-alikes.
+    public static HashSet<string> AllowedHosts(Entry e)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string host = string.IsNullOrEmpty(e.Host) ? e.Site : e.Host;   // old entries predating Host fall back to the registrable domain
+        if (host.Length == 0) return set;
+        set.Add(host);
+        if (host.StartsWith("www.")) set.Add(host.Substring(4)); else set.Add("www." + host);
+        return set;
+    }
+
+    // The entry may fill on `url` only when it is https and its exact host is one of the entry's allowed hosts.
+    public static bool EntryMatches(Entry e, string url)
+    {
+        if (e == null || !Uri.TryCreate(url, UriKind.Absolute, out var u) || u.Scheme != "https") return false;
+        return AllowedHosts(e).Contains(HostOf(u.Host));
+    }
+
     public static string Mask(string user)
     {
         if (string.IsNullOrEmpty(user)) return "(no username)";
@@ -108,10 +144,11 @@ static class Vault
     // ---- entries
 
     // Expires what is due: deletes the ciphertext and queues the site's browser data for clearing. Returns the sites that expired now.
+    // Expiry is driven by the timestamp sealed inside the ciphertext (Stamp), not the plaintext SavedAt, so editing the file can't extend a login.
     public static List<string> Sweep() => Locked(() =>
     {
         var list = LoadEntries(); var gone = new List<string>();
-        foreach (var e in list.Where(e => !e.Expired && Now() >= e.SavedAt + Life)) { e.Blob = null; e.Salt = null; gone.Add(e.Site); }
+        foreach (var e in list.Where(e => !e.Expired)) { var st = Stamp(e); if (st == null || Now() >= st.Value + Life) { e.Blob = null; e.Salt = null; if (!gone.Contains(e.Site)) gone.Add(e.Site); } }
         if (gone.Count > 0)
         {
             SaveEntries(list);
@@ -124,11 +161,13 @@ static class Vault
 
     public static string Save(string siteText, string user, string password)
     {
-        string site = Site(siteText);
+        string site = Site(siteText), host = HostOf(siteText);
         if (site.Length == 0 || !site.Contains('.') || IPAddress.TryParse(site, out _)) return "Give the site as a web address, e.g. github.com.";
+        if (host.Length == 0) host = site;
         if (string.IsNullOrEmpty(password)) return "Type the password.";
+        DateTime saved = Now();
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        byte[] plain = Encoding.UTF8.GetBytes(password);
+        byte[] plain = Pack(saved, password);               // the save time is sealed inside the ciphertext, bound to the site via entropy
         string blob;
         try { blob = Convert.ToBase64String(ProtectedData.Protect(plain, Entropy(salt, site), DataProtectionScope.CurrentUser)); }
         finally { CryptographicOperations.ZeroMemory(plain); }
@@ -136,11 +175,22 @@ static class Vault
         {
             var list = LoadEntries();
             list.RemoveAll(e => e.Site == site && string.Equals(e.User, user ?? "", StringComparison.OrdinalIgnoreCase));
-            list.Add(new Entry { Site = site, User = user ?? "", Blob = blob, Salt = Convert.ToBase64String(salt), SavedAt = Now() });
+            list.Add(new Entry { Site = site, Host = host, User = user ?? "", Blob = blob, Salt = Convert.ToBase64String(salt), SavedAt = saved });
             SaveEntries(list);
             return 0;
         });
         return "";
+    }
+
+    // "v1|<savedAtUtcTicks>|<password>" -> bytes, and back. The timestamp travels inside the encrypted blob so it is tamper-evident.
+    static byte[] Pack(DateTime savedUtc, string pw) => Encoding.UTF8.GetBytes("v1|" + savedUtc.ToUniversalTime().Ticks + "|" + pw);
+    static (DateTime? At, string Pw) Unpack(byte[] plain)
+    {
+        string s = Encoding.UTF8.GetString(plain);
+        var p = s.Split('|', 3);
+        if (p.Length == 3 && p[0] == "v1" && long.TryParse(p[1], out long ticks) && ticks > 0 && ticks <= DateTime.MaxValue.Ticks)
+            return (new DateTime(ticks, DateTimeKind.Utc), p[2]);
+        return (null, null);
     }
 
     public static void Remove(string site, string user) => Locked(() =>
@@ -161,9 +211,27 @@ static class Vault
 
     internal static string Reveal(Entry e)
     {
-        if (e == null || e.Expired || Now() >= e.SavedAt + Life) return null;
-        byte[] plain = ProtectedData.Unprotect(Convert.FromBase64String(e.Blob), Entropy(Convert.FromBase64String(e.Salt), e.Site), DataProtectionScope.CurrentUser);
-        try { return Encoding.UTF8.GetString(plain); } finally { CryptographicOperations.ZeroMemory(plain); }
+        if (e == null || e.Expired) return null;
+        byte[] plain;
+        try { plain = ProtectedData.Unprotect(Convert.FromBase64String(e.Blob), Entropy(Convert.FromBase64String(e.Salt), e.Site), DataProtectionScope.CurrentUser); }
+        catch { return null; }
+        try
+        {
+            var (at, pw) = Unpack(plain);
+            if (at == null || Now() >= at.Value + Life) return null;   // missing/invalid sealed timestamp, or past 7 days: treat as expired
+            return pw;
+        }
+        finally { CryptographicOperations.ZeroMemory(plain); }
+    }
+
+    // The sealed save time, or null if the blob is gone/corrupt/not ours. Used by Sweep so expiry can't be pushed out by editing SavedAt.
+    internal static DateTime? Stamp(Entry e)
+    {
+        if (e == null || e.Blob == null || e.Salt == null) return null;
+        byte[] plain;
+        try { plain = ProtectedData.Unprotect(Convert.FromBase64String(e.Blob), Entropy(Convert.FromBase64String(e.Salt), e.Site), DataProtectionScope.CurrentUser); }
+        catch { return null; }
+        try { return Unpack(plain).At; } finally { CryptographicOperations.ZeroMemory(plain); }
     }
 
     // ---- ages of sessions in the background profile
@@ -197,6 +265,11 @@ static class Vault
 
     internal static int SelfTest()
     {
+        if (Environment.GetEnvironmentVariable("VOWENLITE_DATA") == null)   // --vaulttest wipes vault.json/browser-sites.json: never against the real profile
+        {
+            Console.WriteLine("refusing to run: set VOWENLITE_DATA to a scratch folder first (this test deletes vault.json / browser-sites.json).");
+            return 2;
+        }
         int fail = 0;
         void Check(string name, bool ok) { Console.WriteLine((ok ? "PASS " : "FAIL ") + name); if (!ok) fail++; }
         var real = Now;
@@ -251,6 +324,39 @@ static class Vault
             Check("password value never listed: " + listing, !listing.Contains(pw) && listing.Contains("filled"));
             Check("card value never listed: " + card, !card.Contains("4111"));
             Check("scrub removes secrets", !WebHost.Scrub("hi Fake-Pass-7731! there jo.doe@mail.test", new List<string> { pw, "jo.doe@mail.test" }).Contains(pw));
+
+            // M2: a password that leaked into a URL (GET form, redirect) is percent-encoded; the scrubber must catch those forms too.
+            string enc = Uri.EscapeDataString(pw);
+            string leaked = "URL: https://x.test/login?u=jo.doe%40mail.test&p=" + enc + " done";
+            string scrubbed = WebHost.Scrub(leaked, new List<string> { pw, "jo.doe@mail.test" });
+            Check("encoded secret scrubbed: " + scrubbed, !scrubbed.Contains(enc) && !scrubbed.Contains(pw));
+
+            // H2: a saved entry fills only on the exact host it was typed for (+ the www/bare pair); not subdomains or look-alikes.
+            var gh = new Entry { Site = "github.com", Host = "github.com" };
+            Check("exact host matches", Vault.EntryMatches(gh, "https://github.com/login"));
+            Check("www pair matches", Vault.EntryMatches(gh, "https://www.github.com/login"));
+            Check("subdomain gist.github.com refused", !Vault.EntryMatches(gh, "https://gist.github.com/login"));
+            Check("look-alike github.com.evil.io refused", !Vault.EntryMatches(gh, "https://github.com.evil.io/login"));
+            Check("userinfo github.com@evil.io refused", !Vault.EntryMatches(gh, "https://github.com@evil.io/login"));
+            Check("http refused (entry)", !Vault.EntryMatches(gh, "http://github.com/login"));
+            var sub = new Entry { Site = "github.com", Host = "login.github.com" };
+            Check("host-specific entry: bare domain refused", !Vault.EntryMatches(sub, "https://github.com/x") && Vault.EntryMatches(sub, "https://login.github.com/x"));
+
+            // C1: the save time is sealed in the ciphertext; editing the plaintext SavedAt can't revive or extend an entry.
+            clock = t0; Save("stamp.test", "u", pw);
+            var se = Find("stamp.test");
+            var forged = new Entry { Site = se.Site, Host = se.Host, User = se.User, Blob = se.Blob, Salt = se.Salt, SavedAt = t0 + TimeSpan.FromDays(100) };
+            clock = t0 + TimeSpan.FromDays(8);
+            Check("sealed timestamp beats a forged SavedAt", Reveal(forged) == null && Stamp(forged) != null && Now() >= Stamp(forged).Value + Life);
+            var corrupt = new Entry { Site = se.Site, Host = se.Host, User = se.User, Blob = Convert.ToBase64String(Encoding.UTF8.GetBytes("not a dpapi blob")), Salt = se.Salt, SavedAt = t0 };
+            clock = t0;
+            Check("corrupt blob = expired", Reveal(corrupt) == null && Stamp(corrupt) == null);
+
+            // H1: private-address classification covers the forms an attacker would reach for (decimal/hex/IPv6-mapped/CGNAT/ULA).
+            foreach (var h in new[] { "127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.1.1", "172.16.0.1", "100.64.0.1", "2130706433", "0x7f.0.0.1", "0177.0.0.1", "[::1]", "[::ffff:127.0.0.1]", "[fc00::1]", "[fe80::1]", "0.0.0.0", "localhost", "foo.localhost", "box.local" })
+                Check($"private host blocked: {h}", WebHost.IsPrivateHostForTest(h));
+            foreach (var h in new[] { "example.com", "8.8.8.8", "github.com", "[2606:4700:4700::1111]" })
+                Check($"public host allowed: {h}", !WebHost.IsPrivateHostForTest(h));
         }
         finally { Now = real; }
         Console.WriteLine(fail == 0 ? "ALL PASS" : fail + " FAILED");

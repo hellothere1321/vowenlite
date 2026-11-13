@@ -21,6 +21,7 @@ static class Watcher
         {
             var psi = new ProcessStartInfo(Environment.ProcessPath) { UseShellExecute = false, WorkingDirectory = Paths.AppDir };
             foreach (var a in new[] { "--daemon", "--watcher", Environment.ProcessId.ToString() }) psi.ArgumentList.Add(a);
+            psi.Environment["DOTNET_GCgen0size"] = "0x100000";   // 1 MB gen0 budget: measured ~7 MB less private memory in the daemon, only a few extra tiny GCs (env var only; no runtimeconfig knob exists)
             int code;
             try
             {

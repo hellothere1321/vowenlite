@@ -49,6 +49,7 @@ static class Cards
     // (click it to open the answer again), one without goes away by itself after a while.
     public static void EndWork(int id, string message, bool failed = false, string detail = null, string thread = null)
     {
+        Task.Run(async () => { await Task.Delay(4000); Native.TrimSelf(); });   // a Codex job leaves a lot of garbage and touched pages behind; give them back once the result is out
         bool keep;
         lock (works)
         {

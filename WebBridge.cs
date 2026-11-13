@@ -59,13 +59,17 @@ fetch('http://127.0.0.1:" + GitBridge.Port + @"/web', { method: 'POST', headers:
         "If it says there is no saved login (or it expired), tell the user to add it with \"open passwords\" and stop. If it says a code, CAPTCHA or other check needs the user, stop and tell them. " +
         "Never press a final Pay / Buy / Place order / Send / Delete control, and don't type card details: get it ready and tell the user. Keep it to what was asked (at most ~40 actions).\n\n";
 
+    // constant-time compare, so the token can't be guessed byte by byte from response timing
+    static bool TokenOk(string given) =>
+        given != null && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(System.Text.Encoding.UTF8.GetBytes(given), System.Text.Encoding.UTF8.GetBytes(GitBridge.Token ?? ""));
+
     public static (int, string) Run(string body)
     {
         try
         {
             using var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
-            if (root.GetProperty("token").GetString() != GitBridge.Token) return (126, "web bridge: bad token");
+            if (!TokenOk(root.GetProperty("token").GetString())) return (126, "web bridge: bad token");
             var args = root.GetProperty("args").EnumerateArray().Select(a => a.GetString() ?? "").ToList();
             string text = root.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
             if (args.Count == 0) return (2, "web bridge: give a command (open, read, click, type, key, scroll, back, wait, shot, tabs, tab, close, login, logins)");

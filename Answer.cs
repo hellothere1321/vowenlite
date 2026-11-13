@@ -4,6 +4,13 @@ using Microsoft.Web.WebView2.WinForms;
 
 namespace VowenLite;
 
+// Browser options for the small static windows (answer box, Ask panel, widgets). They SHARE the "webview" user-data
+// folder, and WebView2 needs identical options from every process using one folder: change them in this one place.
+// Software rendering + GPU thread in the browser process measured ~150 MB -> ~75 MB private for an open answer box.
+static class WebOpts
+{
+    public static Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions Tiny() => new("--disable-gpu --in-process-gpu --disable-extensions --disable-background-networking --disable-sync --disable-component-update --disable-default-apps");
+}
 // The answer box (`VowenLite.exe --answer <file>`; the file is the request, a blank line, then the markdown reply).
 // It appears at the bottom right of the MAIN monitor (left of the card stack) once the answer is complete, without taking focus, so it can
 // be read while working: formatted text, tables, code and diagrams (Md.cs). It stays until closed (× / Esc when clicked into); a newer
@@ -94,7 +101,7 @@ sealed class AnswerForm : Form
     {
         try
         {
-            var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Paths.DataDir, "webview"));
+            var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Paths.DataDir, "webview"), WebOpts.Tiny());
             await web.EnsureCoreWebView2Async(env);
             var st = web.CoreWebView2.Settings;
             st.AreDevToolsEnabled = false; st.IsStatusBarEnabled = false; st.AreDefaultContextMenusEnabled = false; st.IsZoomControlEnabled = false;

@@ -40,7 +40,7 @@ sealed class WidgetForm : Form
         try
         {
             string data = Path.Combine(Paths.DataDir, "webview");
-            var env = await CoreWebView2Environment.CreateAsync(null, data);
+            var env = await CoreWebView2Environment.CreateAsync(null, data, WebOpts.Tiny());
             await web.EnsureCoreWebView2Async(env);
             var s = web.CoreWebView2.Settings;
             s.AreDevToolsEnabled = false;

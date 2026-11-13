@@ -248,7 +248,7 @@ sealed class AskPanel : Control
         Controls.Add(web);
         try
         {
-            var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Paths.DataDir, "webview"));
+            var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Paths.DataDir, "webview"), WebOpts.Tiny());
             await web.EnsureCoreWebView2Async(env);
             var st = web.CoreWebView2.Settings;
             st.AreDevToolsEnabled = false; st.IsStatusBarEnabled = false; st.AreDefaultContextMenusEnabled = false; st.IsZoomControlEnabled = false;

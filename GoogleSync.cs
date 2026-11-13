@@ -142,7 +142,7 @@ static class GoogleSync
     {
         try { tok ??= JsonSerializer.Deserialize<Tok>(File.ReadAllText(TokenFile)); } catch { }
     }
-    static void SaveTok() { try { File.WriteAllText(TokenFile, JsonSerializer.Serialize(tok)); } catch { } }
+    static void SaveTok() { try { Paths.Secure(TokenFile, false); File.WriteAllText(TokenFile, JsonSerializer.Serialize(tok)); } catch { } }
 
     static async Task<string> AccessToken()
     {

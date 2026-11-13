@@ -30,13 +30,18 @@ sealed class WebHost : Form
     readonly List<string> notes = new();           // dialogs, blocked downloads... reported with the next reply
     CoreWebView2Environment env;
     Tab cur;
+    GuardProxy proxy;                              // H1: every request the browser makes is forced through this loopback proxy, which re-resolves and refuses private IPs
+    bool loginBusy;                                // M1: a sign-in owns the browser start-to-finish; every other command is refused meanwhile
     DateTime lastCmd = DateTime.UtcNow, lastSweep = DateTime.MinValue;
-    static readonly string TestDir = Environment.GetEnvironmentVariable("VOWENLITE_WEB_TESTDIR");   // tests only: https://login.vltest.example etc. served from a folder
+    // Tests only: https://login.vltest.example etc. served from a folder. Honoured ONLY when the test harness set VOWENLITE_WEBTEST=1,
+    // so a stray VOWENLITE_WEB_TESTDIR in a production environment can never redirect the real browser to a local folder.
+    static readonly string TestDir = Environment.GetEnvironmentVariable("VOWENLITE_WEBTEST") == "1" ? Environment.GetEnvironmentVariable("VOWENLITE_WEB_TESTDIR") : null;
 
     public static int Run()
     {
         using var m = new Mutex(true, @"Local\VowenLite.WebHost." + Vault.Hash(Paths.DataDir.ToLowerInvariant()), out bool first);
         if (!first) return 0;
+        Paths.SecureKnown();
         ApplicationConfiguration.Initialize();
         Application.Run(new WebHost());
         return 0;
@@ -65,8 +70,14 @@ sealed class WebHost : Form
     {
         try
         {
-            var opts = new CoreWebView2EnvironmentOptions("--disable-gpu --disable-features=CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows");
-            env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Paths.DataDir, "browser-profile"), opts);
+            Paths.Secure(Paths.ProfileDir, true);   // C1: lock the profile folder (cookies = sessions) before WebView2 writes anything into it
+            string proxyArg = "";
+            try { proxy = new GuardProxy(); proxy.Start(); proxyArg = $" --proxy-server=127.0.0.1:{proxy.Port} --proxy-bypass-list=<-loopback>"; }
+            catch (Exception ex) { Log("web host: guard proxy failed to start, falling back to name/resolve checks only: " + ex.Message); }
+            // H1: with a proxy set, Chromium hands every hostname (pages, redirects, subresources, WebSockets) to the proxy instead of
+            // resolving and connecting itself; <-loopback> removes Chromium's default localhost bypass so even loopback goes through it.
+            var opts = new CoreWebView2EnvironmentOptions("--disable-gpu --disable-features=CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows" + proxyArg);
+            env = await CoreWebView2Environment.CreateAsync(null, Paths.ProfileDir, opts);
             cur = await NewTab();
             await Sweep(true);
             new Thread(PipeLoop) { IsBackground = true, Name = "web pipe" }.Start();
@@ -136,11 +147,44 @@ sealed class WebHost : Form
         return PrivateHost(u.Host) ? "addresses on this PC or the local network are off limits" : null;
     }
 
+    internal static bool IsPrivateHostForTest(string host) => PrivateHost(host);   // --vaulttest hook
+
     static bool PrivateHost(string host)
     {
-        string h = host.Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+        string h = (host ?? "").Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+        if (h.Length == 0) return false;
         if (h == "localhost" || h.EndsWith(".localhost") || h.EndsWith(".local") || h.EndsWith(".internal") || h.EndsWith(".lan") || h.EndsWith(".home.arpa")) return true;
-        return IPAddress.TryParse(h, out var ip) && PrivateIp(ip);
+        if (IPAddress.TryParse(h, out var ip) && PrivateIp(ip)) return true;
+        return TryNumericIPv4(h, out var ip2) && PrivateIp(ip2);   // decimal/hex/octal literals a browser would canonicalise to 127.0.0.1 etc.
+    }
+
+    // inet_aton-style parse: "2130706433", "0x7f.0.0.1", "0177.0.0.1" and the mixed/short forms browsers accept. Non-numeric hosts -> false.
+    static bool TryNumericIPv4(string host, out IPAddress ip)
+    {
+        ip = null;
+        var parts = host.Split('.');
+        if (parts.Length == 0 || parts.Length > 4) return false;
+        var nums = new ulong[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string p = parts[i];
+            if (p.Length == 0) return false;
+            try
+            {
+                if (p.StartsWith("0x")) { if (p.Length == 2) return false; nums[i] = Convert.ToUInt64(p.Substring(2), 16); }
+                else if (p[0] == '0' && p.Length > 1) { foreach (char c in p) if (c < '0' || c > '7') return false; nums[i] = Convert.ToUInt64(p, 8); }
+                else { foreach (char c in p) if (c < '0' || c > '9') return false; nums[i] = ulong.Parse(p); }
+            }
+            catch { return false; }
+        }
+        int n = nums.Length;
+        for (int i = 0; i < n - 1; i++) if (nums[i] > 255) return false;
+        int remBytes = 4 - (n - 1);
+        if (remBytes < 4 && nums[n - 1] >= (1UL << (8 * remBytes))) return false;
+        uint addr = (uint)nums[n - 1];
+        for (int i = 0; i < n - 1; i++) addr |= (uint)(nums[i] << (8 * (3 - i)));
+        ip = new IPAddress(new[] { (byte)(addr >> 24), (byte)(addr >> 16), (byte)(addr >> 8), (byte)addr });
+        return true;
     }
 
     static bool PrivateIp(IPAddress ip)
@@ -194,7 +238,17 @@ sealed class WebHost : Form
 
     internal static string Scrub(string s, List<string> secrets)
     {
-        foreach (var x in secrets) if (!string.IsNullOrEmpty(x) && x.Length >= 3) s = s.Replace(x, "[hidden]", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(s)) return s;
+        foreach (var x in secrets)
+        {
+            if (string.IsNullOrEmpty(x) || x.Length < 3) continue;
+            s = s.Replace(x, "[hidden]", StringComparison.OrdinalIgnoreCase);
+            // A secret that leaked into a URL (GET form, redirect, error echo) is percent-encoded; strip those forms too (%20 and form '+').
+            string enc = Uri.EscapeDataString(x);
+            if (!string.Equals(enc, x, StringComparison.Ordinal) && enc.Length >= 3) s = s.Replace(enc, "[hidden]", StringComparison.OrdinalIgnoreCase);
+            string form = enc.Replace("%20", "+");
+            if (!string.Equals(form, enc, StringComparison.Ordinal) && form.Length >= 3) s = s.Replace(form, "[hidden]", StringComparison.OrdinalIgnoreCase);
+        }
         return s;
     }
 
@@ -215,6 +269,9 @@ sealed class WebHost : Form
 
     async Task<(int, string)> Do(string cmd, List<string> a, string text)
     {
+        // M1: if a login that overran a client timeout is still running, its awaits let the message loop deliver this next command.
+        // Refuse everything until the login's atomic fill->submit->clear->cleanup finishes, so nothing can peek at a filled field.
+        if (loginBusy && cmd != "login") return (126, "a sign-in is still finishing in the browser; try again in a moment.");
         var t = cur;
         switch (cmd)
         {
@@ -511,7 +568,8 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
 
     const string CheckRx = @"verification code|two-?factor|2-?step|\b2fa\b|authenticator app|one-?time (?:code|password)|security code|enter the code|we (?:sent|texted|emailed) (?:you )?a code|captcha|i'?m not a robot|verify (?:it'?s you|you'?re human|that you)|confirm (?:it'?s you|your identity)|passkey";
 
-    // Finds the sign-in fields (main page + same-site frames) and stores them for the fill step.
+    // Finds the sign-in fields (main page + same-site frames) and stores them for the fill step. Also reports where the form would
+    // submit (action URL + method), so the caller can refuse a form that posts off-site or puts the password in the URL (GET).
     const string FindLoginJs = @"(() => {
   const ins = []; for (const d of __docs()) for (const e of d.querySelectorAll('input')) if (__vis(e) && !e.disabled && !e.readOnly) ins.push(e);
   const pass = ins.find(e => (e.type || '').toLowerCase() === 'password' && !/new-password/.test(e.autocomplete || ''));
@@ -520,87 +578,127 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
   let user = null;
   if (pass) { const before = cands.filter(e => e.compareDocumentPosition(pass) & Node.DOCUMENT_POSITION_FOLLOWING); user = before.length ? before[before.length - 1] : null; } else user = cands[0] || null;
   window.__vlLogin = { user, pass };
+  const form = (pass && pass.form) || (user && user.form) || null;
+  let action = location.href, method = null;
+  if (form) { method = (form.getAttribute('method') || '').toLowerCase(); try { action = new URL(form.getAttribute('action') || '', (form.ownerDocument.defaultView || window).location.href).href; } catch (e) { action = ''; } }
   const top = location.href, pf = pass ? pass.ownerDocument.defaultView.location.href : null;
-  return JSON.stringify({ top, user: !!user, userVal: user ? user.value : '', pass: !!pass, passFrame: pf, crossFrame: [...document.querySelectorAll('iframe')].some(f => { try { return !f.contentDocument; } catch (e) { return true; } }) });
+  return JSON.stringify({ top, user: !!user, userVal: user ? user.value : '', pass: !!pass, passFrame: pf, action, method, crossFrame: [...document.querySelectorAll('iframe')].some(f => { try { return !f.contentDocument; } catch (e) { return true; } }) });
 })()";
 
-    const string ClearPassJs = @"(() => { let n = 0; for (const d of __docs()) for (const e of d.querySelectorAll('input[type=password]')) if (e.value) { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); n++; } return String(n); })()";
+    const string ClearPassJs = @"(() => { let n = 0; for (const d of __docs()) { for (const e of d.querySelectorAll('input[type=password]')) if (e.value) { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); n++; } } if (window.__vlLogin) window.__vlLogin = null; return String(n); })()";
 
-    async Task<(int, string)> Login(Tab t, string siteArg)
+    async Task<(int, string)> Login(Tab host, string siteArg)
     {
         Vault.Sweep();
         await Sweep(false);
-        string pageSite = Uri.TryCreate(t.W.Source, UriKind.Absolute, out var pu) ? Vault.Site(pu.Host) : "";
+        string pageSite = Uri.TryCreate(host.W.Source, UriKind.Absolute, out var pu) ? Vault.Site(pu.Host) : "";
         string site = string.IsNullOrWhiteSpace(siteArg) ? pageSite : Vault.Site(siteArg);
         if (site.Length == 0) return (2, "open the site's sign-in page first, then run `login`.");
         var entry = Vault.Find(site);
         if (entry == null) return (3, $"no saved login for {site}: ask the user to add it (they can say \"open passwords\"). Don't ask them for the password.");
         if (entry.Expired) return (3, $"the saved login for {site} expired (logins last 7 days): ask the user to re-enter it in the vault (\"open passwords\").");
-        if (!Vault.PageMatches(site, t.W.Source)) return (126, $"refused: the open page ({Trim(t.W.Source, 80)}) is not an https page on {site}. Open {site}'s own sign-in page first.");
+        string eHost = string.IsNullOrEmpty(entry.Host) ? entry.Site : entry.Host;
+        if (!Vault.EntryMatches(entry, host.W.Source)) return (126, $"refused: the open page ({Trim(host.W.Source, 80)}) is not an https page on {eHost}. Open {eHost}'s own sign-in page first.");
 
-        string password = null;
+        // M1/M3: the whole fill runs here, start to finish; a throwaway tab holds the filled page so its history/BFCache and any
+        // URL that gained the password (GET form / redirect) are destroyed when we close it, never reachable by a later command.
+        loginBusy = true;
+        var hardStop = DateTime.UtcNow.AddSeconds(70);
+        Tab lt = null; string password = null, text = "", finalUrl = "", finalTitle = "";
+        bool passStill = true, success = false;
+        (int, string)? refusal = null;
         try
         {
-            for (int step = 0; step < 2; step++)
+            lt = await NewTab();
+            await Nav(lt, () => lt.W.Navigate(host.W.Source), 30_000);
+            if (!Vault.EntryMatches(entry, lt.W.Source)) { refusal = (126, $"refused: the page is not on {eHost}."); goto done; }
+            for (int step = 0; step < 2 && DateTime.UtcNow < hardStop; step++)
             {
-                using var f = JsonDocument.Parse(await Eval(t, FindLoginJs));
+                using var f = JsonDocument.Parse(await Eval(lt, FindLoginJs));
                 var r = f.RootElement;
-                if (!Vault.PageMatches(site, Str(r, "top")) || !Vault.PageMatches(site, t.W.Source)) return (126, $"refused: the page left {site}.");
+                if (!Vault.EntryMatches(entry, Str(r, "top")) || !Vault.EntryMatches(entry, lt.W.Source)) { refusal = (126, $"refused: the page left {eHost}."); goto done; }
                 bool hasPass = r.GetProperty("pass").GetBoolean(), hasUser = r.GetProperty("user").GetBoolean();
-                if (hasPass && !Vault.PageMatches(site, Str(r, "passFrame"))) return (126, "refused: the password box is in a frame from another site. That needs the user.");
+                if (hasPass && !Vault.EntryMatches(entry, Str(r, "passFrame"))) { refusal = (126, "refused: the password box is in a frame from another site. That needs the user."); goto done; }
                 if (!hasPass && !hasUser)
                 {
-                    if (step == 0) return (1, (r.GetProperty("crossFrame").GetBoolean() ? "the sign-in form is inside an embedded frame from another site, which the vault won't fill: that needs the user." : "no sign-in form on this page. Click the site's Sign in / Log in link first, then run `login`."));
+                    if (step == 0) { refusal = (1, r.GetProperty("crossFrame").GetBoolean() ? "the sign-in form is inside an embedded frame from another site, which the vault won't fill: that needs the user." : "no sign-in form on this page. Click the site's Sign in / Log in link first, then run `login`."); goto done; }
                     break;
                 }
+                // H2: never let the password be submitted to another host, and never via an explicit GET (which would put it in the URL).
+                // A form with no method attribute is nearly always submitted by the page's script, so it is allowed; if it does turn
+                // out to be a plain GET, the URL stays on this host, dies with the throwaway tab and is scrubbed from every reply.
+                if (hasPass)
+                {
+                    string action = Str(r, "action"), method = Str(r, "method");
+                    if (method == "get") { refusal = (126, "refused: this sign-in form uses GET, which would put the password in the URL. That needs the user."); goto done; }
+                    if (!string.IsNullOrEmpty(action) && !Vault.EntryMatches(entry, action)) { refusal = (126, $"refused: the sign-in form submits to {Trim(action, 80)}, not {eHost}. That needs the user."); goto done; }
+                }
                 if (hasUser && entry.User.Length > 0 && !string.Equals(Str(r, "userVal"), entry.User, StringComparison.OrdinalIgnoreCase))
-                    await Fill(t, "user", entry.User);
-                if (!secrets.Contains(entry.User)) secrets.Add(entry.User);
+                    await Fill(lt, "user", entry.User, false);
+                if (!secrets.Contains(entry.User) && entry.User.Length > 0) secrets.Add(entry.User);
                 if (hasPass)
                 {
                     password ??= Vault.Reveal(entry);
-                    if (password == null) return (3, $"the saved login for {site} expired: ask the user to re-enter it (\"open passwords\").");
+                    if (password == null) { refusal = (3, $"the saved login for {eHost} expired: ask the user to re-enter it (\"open passwords\")."); goto done; }
                     if (!secrets.Contains(password)) secrets.Add(password);
-                    if (!Vault.PageMatches(site, t.W.Source)) return (126, $"refused: the page left {site}.");
-                    await Fill(t, "pass", password);
-                    await Key(t, "enter");
-                    await Settle(t);
+                    if (!Vault.EntryMatches(entry, lt.W.Source)) { refusal = (126, $"refused: the page left {eHost}."); goto done; }
+                    if (!await Fill(lt, "pass", password, true)) { refusal = (126, "refused: couldn't confirm the focus was on this page's password box; that needs the user."); goto done; }
+                    await Key(lt, "enter");
+                    await Settle(lt);
                     await Task.Delay(800);
                     break;
                 }
                 // username-first sign-in (Google, Microsoft...): submit the name, wait for the password page
-                await Key(t, "enter");
-                await Settle(t);
+                await Key(lt, "enter");
+                await Settle(lt);
                 bool appeared = false;
-                for (int i = 0; i < 24 && !appeared; i++) { await Task.Delay(250); appeared = (await Eval(t, "(()=>{for(const d of __docs())for(const e of d.querySelectorAll('input[type=password]'))if(__vis(e))return '1';return '0';})()")) == "1"; }
+                for (int i = 0; i < 24 && !appeared && DateTime.UtcNow < hardStop; i++) { await Task.Delay(250); appeared = (await Eval(lt, "(()=>{for(const d of __docs())for(const e of d.querySelectorAll('input[type=password]'))if(__vis(e))return '1';return '0';})()")) == "1"; }
                 if (!appeared) break;
             }
+            text = await Eval(lt, "(()=>document.body?document.body.innerText.slice(0,4000):'')()");
+            passStill = (await Eval(lt, "(()=>{for(const d of __docs())for(const e of d.querySelectorAll('input[type=password]'))if(__vis(e))return '1';return '0';})()")) == "1";
+            finalUrl = lt.W.Source; finalTitle = lt.W.DocumentTitle;
+            success = !passStill && !Regex.IsMatch(text, CheckRx, RegexOptions.IgnoreCase);
+done:;
         }
         finally
         {
-            try { await Eval(t, ClearPassJs); } catch { }   // nothing vault-filled is left on the page for a later command to reveal
-            password = null;
+            try { if (lt != null) await Eval(lt, ClearPassJs); } catch { }
+            if (lt != null) { try { tabs.Remove(lt); lt.C.Close(); } catch { } }
+            Activate(host);
+            if (password != null) { secrets.Remove(password); password = null; }   // the plaintext leaves memory the moment the fill is done
+            loginBusy = false;
         }
+        if (refusal is { } rf) return rf;
 
-        string text = await Eval(t, "(()=>document.body?document.body.innerText.slice(0,4000):'')()");
-        bool passStill = (await Eval(t, "(()=>{for(const d of __docs())for(const e of d.querySelectorAll('input[type=password]'))if(__vis(e))return '1';return '0';})()")) == "1";
-        string where = $" (page: \"{Trim(t.W.DocumentTitle, 60)}\" — {t.W.Source})";
-        Log($"web host: login on {site} -> " + (Regex.IsMatch(text, CheckRx, RegexOptions.IgnoreCase) ? "needs the user" : passStill ? "form still there" : "ok"));
+        // On success, show the model the page the throwaway landed on (cookies are profile-wide, so the host tab is signed in too).
+        if (success && Vault.EntryMatches(entry, finalUrl)) { try { await Nav(host, () => host.W.Navigate(finalUrl), 30_000); } catch { } }
+        string where = $" (page: \"{Trim(host.W.DocumentTitle, 60)}\" — {host.W.Source})";
+        Log($"web host: login on {eHost} -> " + (Regex.IsMatch(text, CheckRx, RegexOptions.IgnoreCase) ? "needs the user" : passStill ? "form still there" : "ok"));
         if (Regex.IsMatch(text, CheckRx, RegexOptions.IgnoreCase))
-            return (3, $"needs the user: {site} is asking for a verification code / CAPTCHA / extra check after the password. Tell the user; don't try to get past it." + where);
+            return (3, $"needs the user: {eHost} is asking for a verification code / CAPTCHA / extra check after the password. Tell the user; don't try to get past it." + where);
         if (passStill)
         {
             var err = Regex.Match(text, @"[^\n]*(?:incorrect|invalid|wrong|didn'?t match|doesn'?t match|not recognized|try again|locked)[^\n]*", RegexOptions.IgnoreCase);
             return (1, "sign-in didn't go through" + (err.Success ? $": the site says \"{Trim(err.Value, 140)}\"" : "") + ". Don't retry more than once; if it fails again tell the user the saved login may be wrong (they can fix it with \"open passwords\")." + where);
         }
-        return (0, $"signed in as {Vault.Mask(entry.User)} on {site}" + where);
+        return (0, $"signed in as {Vault.Mask(entry.User)} on {eHost}" + where);
     }
 
-    async Task Fill(Tab t, string which, string value)
+    // Focuses the stored field and types into it, but only after confirming the focus actually landed on that element (H3) and,
+    // for the password, that the focused element really is a password box — so an SPA re-render can't divert the secret elsewhere.
+    async Task<bool> Fill(Tab t, string which, string value, bool secret)
     {
-        await Eval(t, $"(()=>{{const e=window.__vlLogin&&window.__vlLogin.{which}; if(!e) return '0'; e.focus(); e.select && e.select(); return '1';}})()");
+        string ok = await Eval(t, $@"(()=>{{const e=window.__vlLogin&&window.__vlLogin.{which}; if(!e||!e.isConnected) return 'gone';
+  e.focus(); if (e.select) e.select();
+  const d=e.ownerDocument; if (d.activeElement!==e) return 'nofocus';
+  const ty=(e.getAttribute('type')||'').toLowerCase();
+  if ({(secret ? "true" : "false")} && ty!=='password') return 'notpw';
+  return 'ok';}})()");
+        if (ok != "ok") return false;
         await Cdp(t, "Input.insertText", new { text = value });
         await Task.Delay(120);
+        return true;
     }
 
     // ---- 7-day sessions: wipe the cookies and storage of expired vault sites and of any site whose cookies were first seen 7+ days ago
@@ -615,16 +713,158 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
             if (t == null) return;
             var cookies = await t.W.CookieManager.GetCookiesAsync(null);
             foreach (var site in cookies.Select(c => Vault.Site(c.Domain.TrimStart('.'))).Where(s => s.Length > 0).Distinct()) if (!Vault.Known(site)) Vault.NoteSite(site);
-            foreach (var (site, origins) in Vault.DueClears())
-            {
-                int n = 0;
-                foreach (var c in cookies.Where(c => Vault.Site(c.Domain.TrimStart('.')) == site)) { t.W.CookieManager.DeleteCookie(c); n++; }
-                foreach (var o in origins.Append("https://" + site).Append("https://www." + site).Distinct())
-                    try { await Cdp(t, "Storage.clearDataForOrigin", new { origin = o, storageTypes = "all" }); } catch { }
-                Vault.Cleared(site);
-                Log($"web host: cleared {site} ({n} cookies, {origins.Count} origins): its 7 days were up");
-            }
+            var due = Vault.DueClears();
+            if (due.Count == 0) return;
+            // M4: once ANYTHING is due to expire, wipe the WHOLE profile — every cookie and all storage for every origin we can name.
+            // Partitioned/SSO cookies and storage a per-site wipe would miss (e.g. accounts.google.com backing a site you signed into)
+            // die too. This is the simplest option that guarantees the expired session cannot survive anywhere in the profile.
+            int n = 0;
+            foreach (var c in cookies) { try { t.W.CookieManager.DeleteCookie(c); n++; } catch { } }
+            var origins = cookies.Select(c => "https://" + c.Domain.TrimStart('.'))
+                .Concat(due.SelectMany(d => d.Origins))
+                .Concat(due.SelectMany(d => new[] { "https://" + d.Site, "https://www." + d.Site }))
+                .Where(o => o.Length > 8).Distinct().ToList();
+            foreach (var o in origins) try { await Cdp(t, "Storage.clearDataForOrigin", new { origin = o, storageTypes = "all" }); } catch { }
+            try { await Cdp(t, "Network.clearBrowserCache", new { }); } catch { }
+            foreach (var (site, _) in due) Vault.Cleared(site);
+            Log($"web host: wiped the profile ({n} cookies, {origins.Count} origins) because {due.Count} session(s) expired");
         }
         catch (Exception ex) { Log("web host: sweep failed: " + ex.Message); }
+    }
+
+    // ---- H1: in-process forward proxy on loopback. Chromium (started with --proxy-server pointing here) sends every connection here;
+    // we re-resolve the host, refuse any that maps to loopback/private/link-local/CGNAT/ULA, and connect to the exact validated IP, so
+    // a public URL that redirects to a private one, or a DNS name that rebinds to 127.0.0.1, can never reach the PC or the bridges.
+    // The sandbox account can also reach this loopback port, but that gains it nothing: the proxy only ever connects onward to public IPs.
+    sealed class GuardProxy
+    {
+        TcpListener listener;
+        public int Port { get; private set; }
+
+        public void Start()
+        {
+            listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            _ = Task.Run(Accept);
+        }
+
+        async Task Accept()
+        {
+            while (true)
+            {
+                TcpClient c;
+                try { c = await listener.AcceptTcpClientAsync(); } catch { return; }
+                _ = Task.Run(() => Serve(c));
+            }
+        }
+
+        async Task Serve(TcpClient client)
+        {
+            using (client)
+            {
+                try
+                {
+                    client.NoDelay = true;
+                    var cs = client.GetStream();
+                    var (line, head, leftover) = await ReadHead(cs);
+                    if (line == null) return;
+                    var parts = line.Split(' ');
+                    if (parts.Length < 3) { await Deny(cs, 400, "Bad Request"); return; }
+                    string method = parts[0], target = parts[1];
+
+                    string host; int port; bool connect = method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase);
+                    if (connect)
+                    {
+                        int ci = target.LastIndexOf(':');
+                        host = ci > 0 ? target.Substring(0, ci) : target;
+                        port = ci > 0 && int.TryParse(target.Substring(ci + 1), out int pp) ? pp : 443;
+                    }
+                    else if (Uri.TryCreate(target, UriKind.Absolute, out var au)) { host = au.Host; port = au.Port > 0 ? au.Port : 80; }
+                    else { await Deny(cs, 400, "Bad Request"); return; }
+
+                    var ip = Resolve(host);
+                    if (ip == null) { await Deny(cs, connect ? 403 : 403, "Forbidden"); Log($"web host: proxy refused {host} (private/unresolvable)"); return; }
+
+                    using var up = new TcpClient();
+                    await up.ConnectAsync(ip, port);
+                    up.NoDelay = true;
+                    var us = up.GetStream();
+
+                    if (connect)
+                    {
+                        byte[] ok = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
+                        await cs.WriteAsync(ok);
+                    }
+                    else
+                    {
+                        // Rewrite the absolute-form request line to origin-form and forward the original headers/body bytes.
+                        string path = Uri.TryCreate(target, UriKind.Absolute, out var u2) ? u2.PathAndQuery : target;
+                        byte[] reqLine = Encoding.ASCII.GetBytes($"{method} {path} {parts[2]}\r\n");
+                        await us.WriteAsync(reqLine);
+                        await us.WriteAsync(head);        // headers (includes Host) + any body bytes already read
+                        if (leftover.Length > 0) await us.WriteAsync(leftover);
+                    }
+
+                    await Task.WhenAny(Pump(cs, us), Pump(us, cs));
+                }
+                catch { }
+            }
+        }
+
+        // Validate the destination: refuse if the host, or ANY address it resolves to, is private (defeats rebinding). Return the IP to use.
+        static IPAddress Resolve(string host)
+        {
+            string h = (host ?? "").Trim('[', ']');
+            if (PrivateHost(h)) return null;
+            if (IPAddress.TryParse(h, out var lit)) return PrivateIp(lit) ? null : lit;
+            if (TryNumericIPv4(h, out var num)) return PrivateIp(num) ? null : num;
+            IPAddress[] addrs;
+            try { var t = Dns.GetHostAddressesAsync(h); if (!t.Wait(4000)) return null; addrs = t.Result; } catch { return null; }
+            if (addrs.Length == 0 || addrs.Any(PrivateIp)) return null;
+            return addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) ?? addrs[0];
+        }
+
+        static async Task Deny(NetworkStream cs, int code, string msg)
+        {
+            try { await cs.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 {code} {msg}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")); } catch { }
+        }
+
+        static async Task Pump(NetworkStream a, NetworkStream b)
+        {
+            var buf = new byte[16384];
+            try { int n; while ((n = await a.ReadAsync(buf)) > 0) await b.WriteAsync(buf.AsMemory(0, n)); } catch { }
+            try { b.Close(); } catch { }
+        }
+
+        // Read up to the end of the request headers; returns the request line, the raw header block (with trailing CRLFCRLF) and any extra bytes.
+        static async Task<(string Line, byte[] Head, byte[] Leftover)> ReadHead(NetworkStream s)
+        {
+            var buf = new List<byte>();
+            var one = new byte[4096];
+            while (buf.Count < 64 * 1024)
+            {
+                int n = await s.ReadAsync(one);
+                if (n <= 0) break;
+                buf.AddRange(one.AsSpan(0, n).ToArray());
+                int idx = IndexOfCrlfCrlf(buf);
+                if (idx >= 0)
+                {
+                    byte[] all = buf.ToArray();
+                    int headEnd = idx + 4;
+                    string block = Encoding.ASCII.GetString(all, 0, headEnd);
+                    int firstEol = block.IndexOf("\r\n", StringComparison.Ordinal);
+                    string line = firstEol > 0 ? block.Substring(0, firstEol) : block.TrimEnd();
+                    return (line, all[..headEnd], all[headEnd..]);
+                }
+            }
+            return (null, null, null);
+        }
+
+        static int IndexOfCrlfCrlf(List<byte> b)
+        {
+            for (int i = 0; i + 3 < b.Count; i++) if (b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10) return i;
+            return -1;
+        }
     }
 }

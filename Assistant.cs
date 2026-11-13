@@ -501,27 +501,53 @@ static class Assistant
         return false;
     }
 
-    static volatile bool stopSpeaking;
-    public static void StopSpeaking() => stopSpeaking = true;
+    // Speech runs in a short-lived child (`VowenLite.exe --say <file>`): SAPI + the dynamic binder cost ~40 MB
+    // of working set and never unload, so the always-on daemon must not host them.
+    static System.Diagnostics.Process sayProc;
+    public static int SayPid { get { try { return sayProc?.Id ?? -1; } catch { return -1; } } }
+    public static void StopSpeaking()
+    {
+        var p = sayProc; sayProc = null;
+        try { if (p != null && !p.HasExited) p.Kill(); } catch { }
+        try { p?.Dispose(); } catch { }
+    }
 
     public static void Speak(string text)
     {
         if (text.Length > 1500) text = text.Substring(0, 1500);
-        stopSpeaking = false;
+        StopSpeaking();
+        try
+        {
+            string file = Path.Combine(Path.GetTempPath(), "vowenlite-say-" + Guid.NewGuid().ToString("N") + ".txt");
+            File.WriteAllText(file, text);
+            var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath, "--say \"" + file + "\"") { UseShellExecute = false, CreateNoWindow = true });
+            if (p == null) return;
+            Jobs.Add(p);
+            sayProc = p;
+        }
+        catch { }
+    }
+
+    // The --say child: speaks the text in the file, deletes it, exits.
+    public static int SayMain(string file)
+    {
+        string text = "";
+        try { text = File.ReadAllText(file); File.Delete(file); } catch { }
+        if (text.Length == 0) return 0;
         var t = new Thread(() =>
         {
             try
             {
                 var type = Type.GetTypeFromProgID("SAPI.SpVoice");
                 if (type == null) return;
-                dynamic voice = Activator.CreateInstance(type);
-                voice.Speak(text, 1);   // async, so "stop talking" can interrupt
-                while (!(bool)voice.WaitUntilDone(100)) if (stopSpeaking) { voice.Speak("", 3); break; }
+                object voice = Activator.CreateInstance(type);
+                type.InvokeMember("Speak", System.Reflection.BindingFlags.InvokeMethod, null, voice, new object[] { text, 0 });   // 0 = synchronous
             }
             catch { }
         });
         t.SetApartmentState(ApartmentState.STA);
-        t.IsBackground = true;
         t.Start();
+        t.Join();
+        return 0;
     }
 }
