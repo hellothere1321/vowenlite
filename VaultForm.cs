@@ -19,10 +19,10 @@ sealed class VaultForm : Form
     static TextBox Box(bool secret) => new()
     {
         BorderStyle = BorderStyle.None, BackColor = Theme.S2, ForeColor = Theme.Ink, Font = Theme.Font(Theme.Body, 10.5f),
-        UseSystemPasswordChar = secret, ShortcutsEnabled = !secret,
+        UseSystemPasswordChar = secret,   // Windows already blocks copy/cut out of a password box; paste in must work (password managers)
     };
 
-    public VaultForm()
+    public VaultForm(string prefillSite = null)
     {
         Text = "VowenLite passwords";
         AutoScaleMode = AutoScaleMode.None;
@@ -54,10 +54,11 @@ sealed class VaultForm : Form
         };
         Layout += (_, _) => Arrange();
         Refill();
+        if (!string.IsNullOrWhiteSpace(prefillSite)) { site.Text = Vault.HostOf(prefillSite); status.Text = "Luna needs a login for this site. Add your username and password."; }
     }
 
     protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Theme.DarkTitleBar(Handle); }
-    protected override void OnShown(EventArgs e) { base.OnShown(e); site.Focus(); }
+    protected override void OnShown(EventArgs e) { base.OnShown(e); (site.Text.Length > 0 ? user : site).Focus(); Activate(); }
 
     void Arrange()
     {

@@ -55,8 +55,13 @@ static class WebTest
         Check("ordinary type works", o.StartsWith("exit 0") && o.Contains("typed 11"), o);
         o = Do("read");
         Check("typed value shows in read", o.Contains("= \"Test Person\""), o);
-        o = Do("click", Ref(o, "\"Next step\""));
-        Check("click navigates", o.Contains("welcome.html"), o);
+        o = Do("click", Ref(o, "\"Next step\""), "--read");
+        Check("click can navigate and read the resulting page", o.Contains("welcome.html") && o.Contains("Welcome back"), o);
+
+        o = Do("open", "https://login.vltest.example/components.html");
+        Check("reads nested web component links and text", o.Contains("Course readings") && Ref(o, "Module 13") != "0", o);
+        o = Do("click", Ref(o, "Module 13"), "--read");
+        Check("opens a link inside nested web components", o.Contains("welcome.html") && o.Contains("Welcome back"), o);
 
         Check("file: blocked", Do("open", "file:///C:/Windows/win.ini").StartsWith("exit 126"));
         Check("loopback blocked", Do("open", "http://127.0.0.1:9/").StartsWith("exit 126"));
@@ -105,6 +110,16 @@ f.onsubmit = (e) => { e.preventDefault();
 """);
         File.WriteAllText(Path.Combine(dir, "mfa.html"), """
 <!doctype html><meta charset="utf-8"><title>VL test check</title><h1>Two-step verification</h1><p>Enter the verification code we sent to your phone.</p><input name="code">
+""");
+        File.WriteAllText(Path.Combine(dir, "components.html"), """
+<!doctype html><meta charset="utf-8"><title>Course</title>
+<div id="course"></div>
+<script>
+const courseRoot = document.getElementById('course').attachShadow({mode:'open'});
+courseRoot.innerHTML = '<h1>Course readings</h1><div id="modules"></div>';
+courseRoot.getElementById('modules').attachShadow({mode:'open'}).innerHTML =
+  '<a href="welcome.html">Module 13</a>';
+</script>
 """);
         File.WriteAllText(Path.Combine(dir, "card.html"), """
 <!doctype html><meta charset="utf-8"><title>VL test checkout</title><h1>Checkout</h1>

@@ -57,14 +57,92 @@ sealed class WebHost : Form
         Bounds = new Rectangle(vs.Left - VW - 4000, vs.Top, VW, VH);
         Text = "VowenLite web host";
         Load += async (_, _) => await Start();
+        done = new Button { Text = "I'm signed in", Dock = DockStyle.Right, Width = 150, FlatStyle = FlatStyle.System };
+        done.Click += async (_, _) =>
+        {
+            if (!userMode || !done.Enabled) return;
+            DateTime began = userSince;
+            done.Enabled = false;
+            done.Text = "Returning to Luna…";
+            await Task.Delay(400);
+            if (userMode && userSince == began) FinishHandoff(true);
+        };
+        bar = new Panel { Dock = DockStyle.Top, Height = BarH, Visible = false, BackColor = Color.FromArgb(32, 34, 40) };
+        bar.Controls.Add(done);
+        bar.Controls.Add(new Label { Text = "Sign in here yourself, then press the button. Luna never sees what you type.", ForeColor = Color.White, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 0, 0) });
+        Controls.Add(bar);
         var idle = new System.Windows.Forms.Timer { Interval = 10_000 };
-        idle.Tick += (_, _) => { if (DateTime.UtcNow - lastCmd > Idle) Close(); };
+        idle.Tick += (_, _) =>
+        {
+            if (userMode) { if (DateTime.UtcNow - userSince > WebBridge.HandoffLimit) FinishHandoff(false); return; }
+            if (DateTime.UtcNow - lastCmd > Idle) Close();
+        };
         idle.Start();
     }
 
+    // ---- hand the browser to the user: on screen, activatable, with a "signed in" bar. Same profile, so the session stays for Luna.
+    const int BarH = 40;
+    readonly Panel bar;
+    readonly Button done;
+    bool userMode;
+    bool handoffReturned;
+    DateTime userSince;
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
+
+    void UserMode(bool on)
+    {
+        if (userMode == on) return;
+        userMode = on; userSince = DateTime.UtcNow; lastCmd = DateTime.UtcNow;
+        if (on)
+        {
+            done.Text = "I'm signed in";
+            done.Enabled = true;
+        }
+        int ex = GetWindowLong(Handle, -20);
+        if (on)
+        {
+            SetWindowLong(Handle, -20, (ex & ~(0x80 | 0x08000000)) | 0x40000);   // drop TOOLWINDOW|NOACTIVATE, add APPWINDOW: on the taskbar while it is yours
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            int w = Math.Min(VW, wa.Width - 60), h = Math.Min(VH + BarH, wa.Height - 60);
+            bar.Visible = true;
+            Bounds = new Rectangle(wa.Left + (wa.Width - w) / 2, wa.Top + (wa.Height - h) / 2, w, h);
+            Fit(w, h - BarH);
+            TopMost = true;   // not ShowInTaskbar: its setter recreates the window handle and kills every WebView2 inside
+            Activate(); BringToFront();
+            foreach (var t in tabs) try { t.C.MoveFocus(CoreWebView2MoveFocusReason.Programmatic); } catch { }
+        }
+        else
+        {
+            TopMost = false; bar.Visible = false;
+            SetWindowLong(Handle, -20, (GetWindowLong(Handle, -20) & ~0x40000) | 0x80 | 0x08000000);
+            var vs = SystemInformation.VirtualScreen;
+            Bounds = new Rectangle(vs.Left - VW - 4000, vs.Top, VW, VH);
+            Fit(VW, VH);
+        }
+    }
+
+    void FinishHandoff(bool returned)
+    {
+        handoffReturned = returned;
+        UserMode(false);
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        base.OnFormClosing(e);
+        if (userMode && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            FinishHandoff(false);
+        }
+    }
+
+    void Fit(int w, int h) { foreach (var t in tabs) t.C.Bounds = new Rectangle(0, userMode ? BarH : 0, w, h); }
+
     protected override bool ShowWithoutActivation => true;
     protected override CreateParams CreateParams { get { var p = base.CreateParams; p.ExStyle |= 0x80 | 0x08000000; return p; } }   // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-    protected override void WndProc(ref Message m) { if (m.Msg == 0x21) { m.Result = (IntPtr)3; return; } base.WndProc(ref m); }    // WM_MOUSEACTIVATE -> MA_NOACTIVATE
+    protected override void WndProc(ref Message m) { if (m.Msg == 0x21 && !userMode) { m.Result = (IntPtr)3; return; } base.WndProc(ref m); }    // WM_MOUSEACTIVATE -> MA_NOACTIVATE (until the user takes over)
 
     async Task Start()
     {
@@ -90,7 +168,7 @@ sealed class WebHost : Form
     async Task<Tab> NewTab()
     {
         var t = new Tab { C = await env.CreateCoreWebView2ControllerAsync(Handle) };
-        t.C.Bounds = new Rectangle(0, 0, VW, VH);
+        t.C.Bounds = userMode ? new Rectangle(0, BarH, ClientSize.Width, ClientSize.Height - BarH) : new Rectangle(0, 0, VW, VH);
         var s = t.W.Settings;
         s.AreDevToolsEnabled = false; s.AreDefaultContextMenusEnabled = false; s.IsStatusBarEnabled = false; s.AreHostObjectsAllowed = false;
         s.IsWebMessageEnabled = false; s.IsPasswordAutosaveEnabled = false; s.IsGeneralAutofillEnabled = false; s.AreDefaultScriptDialogsEnabled = false;
@@ -227,7 +305,7 @@ sealed class WebHost : Form
                 BeginInvoke(new Action(async () =>
                 {
                     try { done.SetResult(await RunLine(line)); }
-                    catch (Exception ex) { done.TrySetResult((125, "browser error: " + ex.Message)); }
+                    catch (Exception ex) { Log("web host: command failed: " + ex.Message); done.TrySetResult((125, "browser error: " + ex.Message)); }
                 }));
                 var (exit, o) = done.Task.Wait(120_000) ? done.Task.Result : (124, "the browser took too long");
                 w.WriteLine(JsonSerializer.Serialize(new { exit, @out = Scrub(o, secrets) }));
@@ -259,6 +337,10 @@ sealed class WebHost : Form
         string cmd = d.RootElement.GetProperty("cmd").GetString();
         var a = d.RootElement.GetProperty("args").EnumerateArray().Select(x => x.GetString() ?? "").ToList();
         string text = d.RootElement.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String ? tx.GetString() : null;
+        if (cmd == "handoff-status") return userMode ? (75, "waiting for sign-in")
+            : handoffReturned ? (0, "browser returned") : (1, "sign-in window closed or timed out");
+        if (cmd == "handoff-cancel") { FinishHandoff(false); return (0, "sign-in cancelled"); }
+        if (userMode) return (126, "the user is signing in");
         if (DateTime.UtcNow - lastSweep > TimeSpan.FromMinutes(1)) await Sweep(false);
         notes.Clear();
         var (exit, o) = await Do(cmd, a, text);
@@ -303,6 +385,7 @@ sealed class WebHost : Form
                 if (e.GetProperty("hit").GetBoolean()) await Mouse(t, x, y);
                 else await Eval(t, $"(()=>{{const e=(window.__vl||[])[{r - 1}]; e && e.click(); return '1';}})()");
                 await Settle(t);
+                if (a.Contains("--read")) return await Read(cur, 1);
                 return (0, $"clicked [{r}] {Str(id.RootElement, "role")} \"{Trim(name, 60)}\"" + Changed(t, before));
             }
             case "type":
@@ -385,8 +468,22 @@ sealed class WebHost : Form
                 return (0, $"closed tab {n}; now on: {Trim(cur.W.DocumentTitle, 60)} — {cur.W.Source}");
             }
             case "login": return await Login(t, a.Count > 0 ? a[0] : null);
+            case "handoff":
+            {
+                if (a.Count > 0)
+                {
+                    string url = a[0].Contains("://") ? a[0] : "https://" + a[0];
+                    if (Blocked(url) is string why) return (126, "refused: " + why);
+                    if (ResolvesPrivate(new Uri(url).Host) is string why2) return (126, "refused: " + why2);
+                    t.LastError = null;
+                    await Nav(t, () => t.W.Navigate(url), 30_000);
+                }
+                handoffReturned = false;
+                UserMode(true);
+                return (0, "Sign-in window opened. VowenLite will continue the original request when the user returns the browser.");
+            }
         }
-        return (2, $"unknown command \"{cmd}\" (open, read, click, type, key, scroll, back, wait, shot, tabs, tab, close, login, logins)");
+        return (2, $"unknown command \"{cmd}\" (open, read, click, type, key, scroll, back, wait, shot, tabs, tab, close, login, logins, handoff)");
     }
 
     static readonly Regex FinalAction = new(@"^\s*(?:pay|buy|place (?:your )?order|purchase|complete (?:purchase|order|payment)|confirm (?:purchase|order|payment)|submit (?:order|payment)|buy now|pay now|checkout now|subscribe now)\b", RegexOptions.IgnoreCase);
@@ -505,9 +602,36 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
 
     const string ReadJs = @"(() => {
   const sel = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[role=combobox],[role=textbox],[role=searchbox],[contenteditable=""""],[contenteditable=true]';
-  const els = []; for (const d of __docs()) for (const e of d.querySelectorAll(sel)) { if (els.length >= 250) break; if (__vis(e)) els.push(e); }
+  const els = [], text = [];
+  const blocks = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BR|DD|DIV|DL|DT|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TD|TH|TR|UL)$/;
+  function walk(node, inShadow) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (inShadow && node.textContent.trim()) text.push(node.textContent.replace(/\s+/g, ' '));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const e = node, style = getComputedStyle(e);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' ||
+        style.contentVisibility === 'hidden' || e.matches('script,style,template,noscript')) return;
+    if (els.length < 250 && e.matches(sel) && __vis(e)) els.push(e);
+    const block = inShadow && (blocks.test(e.tagName) || /^(block|flex|grid|list-item|table)/.test(style.display));
+    if (block) text.push('\n');
+    if (e.shadowRoot) {
+      text.push('\n');
+      for (const n of e.shadowRoot.childNodes) walk(n, true);
+      text.push('\n');
+    } else if (e.tagName === 'SLOT') {
+      const assigned = e.assignedNodes({flatten:true});
+      for (const n of assigned.length ? assigned : e.childNodes) walk(n, assigned.length === 0 && inShadow);
+    } else {
+      for (const n of e.childNodes) walk(n, inShadow);
+    }
+    if (block) text.push('\n');
+  }
+  const pages = [];
+  for (const d of __docs()) if (d.body) { pages.push(d.body.innerText); walk(d.body, false); }
   window.__vl = els;
-  return JSON.stringify({ title: document.title, url: location.href, text: document.body ? document.body.innerText : '', list: els.map((e, i) => Object.assign({ i: i + 1 }, __d(e))) });
+  return JSON.stringify({ title: document.title, url: location.href, text: pages.join('\n') + '\n' + text.join(''), list: els.map((e, i) => Object.assign({ i: i + 1 }, __d(e))) });
 })()";
 
     async Task<(int, string)> Read(Tab t, int part)
@@ -558,7 +682,15 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
         string raw = await Eval(t, $@"(() => {{ const e = (window.__vl || [])[{r - 1}]; if (!e || !e.isConnected) return 'null';
   e.scrollIntoView({{ block: 'center', inline: 'center' }}); const b = e.getBoundingClientRect(); let x = b.left + b.width / 2, y = b.top + b.height / 2;
   let w = e.ownerDocument.defaultView; while (w && w.frameElement) {{ const f = w.frameElement.getBoundingClientRect(); x += f.left; y += f.top; w = w.parent; }}
-  let hit = false; if (e.ownerDocument === document) {{ const h = document.elementFromPoint(x, y); hit = !!h && (h === e || e.contains(h) || h.contains(e)); }}
+  let hit = false; if (e.ownerDocument === document) {{
+    let h = document.elementFromPoint(x, y);
+    while (h && h !== e && h.shadowRoot) {{
+      const inside = h.shadowRoot.elementFromPoint(x, y);
+      if (!inside || inside === h || inside.getRootNode() !== h.shadowRoot) break;
+      h = inside;
+    }}
+    hit = !!h && (h === e || e.contains(h) || h.contains(e));
+  }}
   return JSON.stringify({{ x, y, hit, info: __d(e) }}); }})()");
         if (raw == "null" || raw.Length == 0) return null;
         return JsonDocument.Parse(raw).RootElement.Clone();

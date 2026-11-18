@@ -583,11 +583,31 @@ static class Luna
 
     static async Task<string> RunCodex(string request, Settings s)
     {
-        try { return await RunCodexInner(request, s); }
-        finally { PcBridge.End(); WebBridge.End(); }   // Luna's hands come off the PC (and its browser) the moment the run ends, however it ends
+        string handoffNote = "";
+        for (int handoffs = 0; ; handoffs++)
+        {
+            try
+            {
+                string answer = await RunCodexInner(request, s, handoffNote);
+                if (!WebBridge.HandoffPending) return answer;
+                if (handoffs >= 3) return "The website kept asking for sign-in. I stopped after three attempts.";
+                PcBridge.End();
+                Cards.Progress(progressWork, "Waiting for you to sign in");
+                bool returned = await WebBridge.WaitForHandoff(() => cancelRequested);
+                if (cancelRequested) throw new OperationCanceledException();
+                if (!returned) return "The sign-in window closed or timed out before I could continue.";
+                Overlay.Notice("Browser returned. Luna is continuing…", 3500);
+                Cards.Progress(progressWork, "Continuing after sign-in");
+                handoffNote = "SIGN-IN HANDOFF COMPLETE: The user pressed I'm signed in and returned the browser. Continue the original request now. "
+                    + "Start with `node vweb.js read` on the current browser tab. Preserve the session and verify the page before doing more. "
+                    + "Only open another sign-in if the current page actually requires it. Do not ask the user to confirm again. "
+                    + "Previous work (check the current state before repeating it): " + StepsDone() + "\n\n";
+            }
+            finally { PcBridge.End(); WebBridge.End(); }
+        }
     }
 
-    static async Task<string> RunCodexInner(string request, Settings s)
+    static async Task<string> RunCodexInner(string request, Settings s, string handoffNote)
     {
         string codex = Summariser.FindCodex(s) ?? throw new FileNotFoundException("Codex CLI not found. Is the Codex app installed?");
         string work = Directory.CreateDirectory(Path.Combine(Paths.DataDir, "luna")).FullName;
@@ -609,7 +629,7 @@ static class Luna
         bool craft = Craft.Ask(request, s);                       // an ArtCraft job (video, image, vector, design, PDF) wins over "make a ... animation" = widget
         bool widget = !craft && WidgetAsk(request);
         bool control = IsControl(request, s, widget);             // needs to see and operate the screen (click, scroll, finish the doc that is open)
-        bool web = !widget && WebBridge.Ask(request, s);          // a website is involved: Luna's own background browser (vweb.js), shell needed
+        bool web = !widget && (handoffNote.Length > 0 || WebBridge.Ask(request, s));
         bool question = !control && !craft && !web && (widget || IsQuestion(request));
         lastRunWasTask = !question;
         PcBridge.Begin(control, craft);                           // vpc.js works only for this run, and only for what was asked
@@ -622,13 +642,13 @@ static class Luna
         }
         projectBlock = widget ? "" : Projects.Context(request, s);   // only when a project is named, or was the last topic (see Projects.cs)
         string shot = null;
-        if (!widget && (control || ScreenAsk.IsMatch(request))) shot = TakeShot(work, control);
+        if (handoffNote.Length == 0 && !widget && (control || ScreenAsk.IsMatch(request))) shot = TakeShot(work, control);
         screenAttached = shot != null;
         screenNote = !screenAttached ? "" : control
             ? "A screenshot of the window the user is in is attached. " + (File.Exists(shot + ".txt") ? PcBridge.NoteShot(shot + ".txt") + " " : "") + "\"this\", \"that\" and \"it\" refer to what is in it.\n\n"
             : ScreenNote;
         try { File.Delete(shot + ".txt"); } catch { }
-        extraBlock = (control ? PcBridge.Help : "") + (web ? WebBridge.Help : "") + (craft ? Craft.Help(s) : "") + (s.Humanize && Brain.Writing.IsMatch(request) ? Humanize.StyleBlock : "");
+        extraBlock = handoffNote + (control ? PcBridge.Help : "") + (web ? WebBridge.Help : "") + (craft ? Craft.Help(s) : "") + (s.Humanize && Brain.Writing.IsMatch(request) ? Humanize.StyleBlock : "");
 
         // Which model: the one named out loud ("Sol, ...", "swap to Terra"), otherwise the cheapest that suits the request (Brain.cs).
         string model = activeModel, effort = s.LunaEffort;
@@ -683,7 +703,7 @@ static class Luna
         string stalled = null;
         while (!await Task.Run(() => p.WaitForExit(500)))
         {
-            if (cancelRequested) break;
+            if (cancelRequested || WebBridge.HandoffPending) break;
             long idle = (Environment.TickCount64 - lastEvent) / 1000;
             if (idle > (commandRunning ? 900 : idleSec)) { stalled = $"no activity for {idle} s" + (commandRunning ? " while a command was running" : ""); break; }
             if (clock.Elapsed.TotalMinutes > capMin) { stalled = $"over the {capMin} min limit"; break; }
@@ -694,6 +714,7 @@ static class Luna
 
         try
         {
+            if (WebBridge.HandoffPending) { try { p.Kill(true); } catch { } return null; }
             if (p.ExitCode != 0)
             {
                 string tail = log.ToString().Trim();
