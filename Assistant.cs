@@ -179,12 +179,14 @@ static class Assistant
     static string Briefing()
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append(DateTime.Now.ToString("dddd, MMMM d")).Append(" · ").Append(DateTime.Now.ToString("h:mm tt")).Append('\n');
+        string coach = Coach.MorningBrief(DateTime.Now);   // planner part (due, blocks, Now pick, overnight); null = the old lines below
+        if (coach == null) sb.Append(DateTime.Now.ToString("dddd, MMMM d")).Append(" · ").Append(DateTime.Now.ToString("h:mm tt")).Append('\n');
+        else sb.Append(coach).Append("\n\n");
         var rem = LoadRem().OrderBy(x => x.Due).ToList();
         var soon = rem.Where(r => r.Due < DateTime.Now.AddHours(24)).Take(4).ToList();
-        if (soon.Count > 0) { sb.Append("\nNext 24 hours\n"); foreach (var r in soon) sb.Append("• ").Append(Pretty(r.Due)).Append(" · ").Append(r.Text).Append('\n'); }
-        else sb.Append("\nNo reminders in the next 24 hours").Append(rem.Count > 0 ? $" ({rem.Count} later)" : "").Append('\n');
-        sb.Append(Planner.Briefing());
+        if (soon.Count > 0) { sb.Append(coach == null ? "\nNext 24 hours\n" : "\n### Reminders, next 24 hours\n"); foreach (var r in soon) sb.Append("• ").Append(Pretty(r.Due)).Append(" · ").Append(r.Text).Append('\n'); }
+        else if (coach == null) sb.Append("\nNo reminders in the next 24 hours").Append(rem.Count > 0 ? $" ({rem.Count} later)" : "").Append('\n');
+        if (coach == null) sb.Append(Planner.Briefing());
         int timers = Commands.Running().Count;
         if (timers > 0) sb.Append($"\n{timers} timer{(timers == 1 ? "" : "s")} running\n");
         string notes = Cards.Try("what are my notes") ?? "";
