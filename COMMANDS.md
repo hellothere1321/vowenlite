@@ -124,6 +124,25 @@ Luna runs Codex with `--ignore-user-config --ignore-rules` (setting `LunaLight`,
 - **Ask / change**: "what's my day", "when is my dentist appointment", "am I free tomorrow at 3", "move dentist to saturday at 4pm", "push the essay to tomorrow", "postpone the meeting by an hour", "rename X to Y", "clear completed tasks"
 - Luna's Codex model can write to the planner itself (`PLAN:` hook) and sees your next 14 days when the request is about plans, tasks or the schedule.
 
+## The assistant around your planner
+- **Planner inbox**: things VowenLite finds (on your screen, in dictation, in lecture notes) wait here for a yes. A "N suggestions" card appears; click it, or say "open my inbox". "accept all suggestions", "clear my inbox".
+- **Plan this**: "plan this", "plan this syllabus", "add this to my planner" reads the window in front plus your clipboard and puts every date and task in the inbox (a syllabus also saves the course's grading weights).
+- **Calendar feeds**: type "add calendar feed <link>" (a school LMS calendar "Subscribe" link or any .ics); due dates become tasks in your School list, refreshed hourly. "refresh my feeds", "what feeds do I have", "remove feed 2".
+- **Promise catcher** (off by default, setting PromiseCatcher): when you dictate "I'll send it by Friday", a card offers to add the task. Nothing is stored unless you accept.
+- **Lectures**: after a recorded meeting/lecture is summarised, assignments said in it go to the inbox.
+- **Now card**: one card always shows the single next thing to do. Click = Start, × = later (1 hour). "what should I do now", "what should I work on next".
+- **Work blocks**: tasks get time estimates and "Work: ..." blocks on your calendar before their due dates; they move themselves when something lands on them or you skip one. "that's 2 hours", "the essay will take 3 hours", "plan my week", "clear my blocks", "don't schedule <task>".
+- **Start**: "start the next thing", "start <task>" opens the task's link, starts a focus timer for the block and minimizes distracting apps (setting Distractions). "I'm done with it", "done with <task>", "end focus".
+- **Time tracking** (local only, setting TrackTime): which app is in front and which task is active, as daily totals. "how long do essays take me", "when do I usually work".
+- **Grades**: "set art 101 weights quizzes 20 exams 50 final 30", "add grade art quiz 8 out of 10", "I got 85 on the art midterm", "what's my grade in art", "can I drop to a B in art", "what do I need on the final to keep an A in art", "update my grades from my screen" / "from the clipboard".
+- **Evening check-in** (setting Rollover, 21:30): a card with what got done, what's slipping and what moved. "how did I do today".
+- **Due tonight**: a task due today and not started gets a card at 6 pm, a spoken reminder at 8 pm (if spoken replies are on) and a phone alert at 9 pm.
+- **Morning brief**: "good morning" / "daily briefing" now leads with what's due, today's work blocks, what to start with and what ran overnight.
+- **Sunday review**: Sunday evening card, or "weekly review" / "how was my week": hours per list, what got done, what's due next week, grade outlook.
+- **Overnight**: "tonight, summarize my readings" / "overnight <job>" runs while the PC is idle and plugged in at night; results wait as cards in the morning. "what's queued for tonight", "cancel tonight's jobs".
+- **Study packs** (setting StudyPacks): before each quiz/test in the planner (3 days out) VowenLite builds a page with a summary, flashcards and a scored practice quiz. "quiz me on <topic>" makes one now. After you tick a quiz done, a card offers a review. Practice and review only: it never answers a live quiz.
+- **Quiet hours** (setting QuietHours, default 00:30-08:00): no cards, speech or phone nudges inside it.
+
 ## Jarvis mode (added 2026-11-10)
 
 Say "Luna, ..." or "Jarvis, ..." with Right Shift, or hold Right Ctrl / Right Alt and just talk.

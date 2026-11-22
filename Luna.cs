@@ -221,7 +221,7 @@ static class Luna
             }
 
             // 2) A single leftover word is nearly always a mis-hearing ("stocktimer"): don't spend a Codex run on it.
-            // Not for replies in a conversation ("yes", "my.ccc.edu") or anything that looks like an address: those are real answers.
+            // Not for replies in a conversation ("yes", "school.edu") or anything that looks like an address: those are real answers.
             if (!forced && !IsWidgetRequest(request) && Regex.Split(request.Trim(), @"\s+").Length <= 1 && !Regex.IsMatch(request, @"[./:@\\\d]"))
             {
                 DoneOnce();
@@ -655,7 +655,7 @@ static class Luna
                 // the window's "I'm signed in" button, or "done" / "I'm signed in" said or typed to Luna (see Start)
                 bool returned = await WebBridge.WaitForHandoff(() => cancelRequested || saidSignedIn);
                 if (cancelRequested) throw new OperationCanceledException();
-                if (!returned && !saidSignedIn) return "The sign-in window closed or timed out before you finished. Say “try again” and I'll open it again.";
+                if (!returned && !saidSignedIn) return "The sign-in window closed before I saw you finish. If you did sign in, say “done” and I'll carry on; otherwise say “try again” to open it again.";
                 saidSignedIn = false;   // WebBridge.End below takes the window off the screen when it was a spoken "done"
                 Overlay.Notice("Browser returned. Luna is continuing…", 3500);
                 Cards.Progress(progressWork, "Continuing after sign-in");
