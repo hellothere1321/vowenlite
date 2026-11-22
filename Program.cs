@@ -21,6 +21,8 @@ static class Program
         if (args.Contains("--plantest")) return PlanTest.Run();
         if (args.Contains("--taptest")) return TapDetector.Test();
         if (args.Contains("--threadtest")) return Threads.Test();
+        // assistant modules (docs/roadmap.md); each refuses to run without VOWENLITE_DATA set to a scratch folder
+        if (args.Length >= 1 && Extras.Tests.TryGetValue(args[0], out var modTest)) return Extras.RunTest(args[0], modTest, args.Skip(1).ToArray());
         if (args.Length >= 2 && args[0] == "--planshot") return PlanShot.Run(args);
         if (args.Contains("--plan"))
         {
@@ -193,6 +195,7 @@ static class Daemon
         Overlay.Create();
         Assistant.Restore();   // reminders set before the last restart
         Planner.Start();       // calendar alerts + Google sync loop
+        Proactive.Start();     // the assistant modules' timers and cards (feeds, Now card, blocks, nudges, overnight jobs, time tracking)
         dictation = new Dictation();
         Log("daemon up, hotkey " + label + (dictation.Install() ? ", Right Shift dictation" : ", dictation hook FAILED"));
         Native.TrimSelf();

@@ -15,6 +15,9 @@ namespace VowenLite;
 // Logins come from the vault (Vault.cs): the HOST decrypts and fills; nothing secret comes back through here or into daemon.log.
 static class WebBridge
 {
+    // Free spoken/typed commands for the background browser ("close your tabs"); null = not one of these. Called from Extras.TryLocal.
+    internal static string TryLocal(string l, Settings s) => null;
+
     public static volatile bool Enabled;
     static int actions;
     internal static readonly TimeSpan HandoffLimit = TimeSpan.FromMinutes(8);

@@ -29,6 +29,14 @@ sealed class Item
     public string GId { get; set; }
     public string GList { get; set; }                // Google Tasks list id this task lives in
     public DateTime Updated { get; set; } = DateTime.UtcNow;   // last change (remote items: Google's timestamp)
+
+    // Assistant fields (docs/roadmap.md). Local only: Google sync never reads or writes them.
+    public int Est { get; set; }                     // tasks: estimated minutes of work (0 = not estimated yet)
+    public int Spent { get; set; }                   // tasks: minutes actually worked on it (Focus.cs time tracking)
+    public string Source { get; set; } = "";         // "" = you | "feed:<url hash>" | "screen" | "dictation" | "lecture"
+    public string Uid { get; set; }                  // external id for de-duplication (a calendar feed's UID)
+    public string Link { get; set; } = "";           // URL or path that Start opens (the quiz page, the doc, a repo)
+    public string BlockFor { get; set; }             // events: a work block reserved for the task with this Id (Schedule.cs owns these)
 }
 
 // One occurrence of an event (a repeating event has many).

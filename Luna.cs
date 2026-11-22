@@ -736,7 +736,7 @@ static class Luna
     // "what's this error on my screen", "what am I looking at", "read my screen": attach a picture of the active window.
     static readonly Regex ScreenAsk = new(@"\b(?:on|in|from)\s+(?:my\s+|the\s+)?screen\b|\b(?:this|that|the|my)\s+(?:doc(?:k|s)?|documents?|box|field|form|section|paragraph|essay|assignment|worksheet|slide|sheet)\b|\b(?:complete|finish|fill(?:\s+(?:in|out))?|continue|answer)\s+(?:this|that|it|the|my)\b|\b(?:my|the)\s+screen\b|\bwhat(?:'s| is| am i)\s+(?:am i\s+)?(?:looking at|seeing)\b|\blook\s+at\s+(?:this|my|the)\b|\bthis\s+(?:error|page|window|code|problem|question|screen)\b|\b(?:read|explain|summari[sz]e)\s+(?:this|that|it)\b", RegexOptions.IgnoreCase);
 
-    static string TakeShot(string dir, bool forControl = false)
+    internal static string TakeShot(string dir, bool forControl = false)
     {
         try
         {

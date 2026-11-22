@@ -207,11 +207,26 @@ static class Cards
         return list.Count > 0;
     }
 
+    // ---------------- cards from other modules (Now card, planner inbox, nudges): one row source per id prefix
+
+    sealed record Source(string Prefix, Func<IEnumerable<Row>> Rows, Action<string> Activate, Action<string> Dismiss);
+    static readonly List<Source> sources = new();
+
+    // Rows() is called on every overlay refresh (about once a second): keep it cheap (no file reads per call).
+    public static void AddSource(string prefix, Func<IEnumerable<Row>> rows, Action<string> activate, Action<string> dismiss)
+    {
+        lock (sources) { sources.RemoveAll(x => x.Prefix == prefix); sources.Add(new Source(prefix, rows, activate, dismiss)); }
+        Overlay.ChipRefresh();
+    }
+
+    static Source SourceFor(string id) { lock (sources) return id == null ? null : sources.FirstOrDefault(x => id.StartsWith(x.Prefix)); }
+
     // ---------------- clicks on cards (see Overlay: x button / right-click = dismiss, body click = activate)
 
     public static void Dismiss(string id)
     {
         if (id == null) return;
+        if (SourceFor(id) is { } src) { try { src.Dismiss?.Invoke(id); } catch { } Overlay.ChipRefresh(); return; }
         if (id.StartsWith("timer:")) Commands.CancelTimer(id.Substring(6));
         else if (id.StartsWith("ring:"))
         {
@@ -228,6 +243,7 @@ static class Cards
 
     public static void Activate(string id)
     {
+        if (SourceFor(id) is { } src) { try { src.Activate?.Invoke(id); } catch { } Overlay.ChipRefresh(); return; }
         if (id == "sw")
         {
             if (swRunning) { swAcc = SwElapsed(); swRunning = false; }
@@ -255,6 +271,10 @@ static class Cards
 
         lock (rings)
             foreach (var r in rings) rows.Add(new Row(CardIcon.Bell, "Time!", r.Title == "Timer" || r.Title == "Reminder" ? ShortText(r.Text) : r.Title, 0, "ring:" + r.Id));
+
+        Source[] srcs;
+        lock (sources) srcs = sources.ToArray();
+        foreach (var src in srcs) { try { rows.AddRange(src.Rows() ?? Enumerable.Empty<Row>()); } catch { } }
 
         lock (works)
         {

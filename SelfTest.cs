@@ -21,6 +21,8 @@ static class SelfTest
         Check(md.IndexOf("You:") < md.IndexOf("Others:"), "sorted by time");
         Check(Transcriber.Format(@"C:\x\y", new()).Contains("No speech"), "empty transcript");
 
+        Extras.SelfChecks(Check);   // pure logic of the assistant modules (no files, no network)
+
         Console.WriteLine(fails == 0 ? "selftest ok" : fails + " failed");
         return fails == 0 ? 0 : 1;
     }

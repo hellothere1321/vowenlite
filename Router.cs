@@ -39,6 +39,9 @@ static class Router
         string t = Commands.Try(r, s);
         if (t != null) return t;
 
+        t = Extras.TryLocal(r, s);   // the planner assistant modules (docs/roadmap.md); existing commands above win
+        if (t != null) return t;
+
         return await OpenAndSearch(r, s);
     }
 

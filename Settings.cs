@@ -173,6 +173,21 @@ class Settings
     public int SettingsVersion { get; set; }              // bumps when a default is changed on purpose (see Load)
     public bool AutoSummarise { get; set; } = true;          // summarise with Codex right after transcribing
 
+    // ---- the assistant around the planner (docs/roadmap.md)
+    public List<string> Feeds { get; set; } = new();         // .ics calendar links (a school's Brightspace feed etc.); their due dates become tasks
+    public string FeedList { get; set; } = "School";         // planner list that feed tasks go into
+    public string QuietHours { get; set; } = "00:30-08:00";  // "HH:mm-HH:mm": no proactive cards, speech or phone nudges inside it ("" = never quiet)
+    public bool NowCard { get; set; } = true;                // the pinned "Now" card with the single next thing to do
+    public bool AutoBlocks { get; set; } = true;             // put work blocks on the calendar before due dates and move them when plans change
+    public int BlockMinutes { get; set; } = 60;              // longest single work block
+    public string Rollover { get; set; } = "21:30";          // evening review card ("" = off)
+    public bool Escalate { get; set; } = true;               // due tonight and not started: card, then spoken, then a phone alert
+    public bool PromiseCatcher { get; set; } = false;        // opt-in: spot commitments in dictated text ("I'll send it Friday") and offer a task
+    public List<string> Distractions { get; set; } = new() { "discord", "steam" };   // process names minimized during a focus block
+    public bool TrackTime { get; set; } = true;              // record which task/app is in front, per day (local only, totals only)
+    public bool Overnight { get; set; } = true;              // run queued jobs ("tonight: ...") while the PC is idle at night
+    public bool StudyPacks { get; set; } = true;             // build summaries, flashcards and a practice quiz before each quiz/test in the planner
+
     static string FilePath => Path.Combine(Paths.DataDir, "settings.json");
     static readonly JsonSerializerOptions Opts = new() { WriteIndented = true };
 
@@ -200,6 +215,15 @@ class Settings
         s.Save();
         return s;
     }
+
+    // Read without the clean-up-and-save of Load (for code that re-reads settings often, e.g. Proactive).
+    public static Settings Peek()
+    {
+        try { if (File.Exists(FilePath)) return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? Load(); } catch { }
+        return Load();
+    }
+
+    public static DateTime Stamp() { try { return File.GetLastWriteTimeUtc(FilePath); } catch { return DateTime.MinValue; } }
 
     public void Save()
     {
