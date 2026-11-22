@@ -107,12 +107,44 @@ sealed class PlanForm : Form
     void Send(JsonNode n) { try { if (web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(n.ToJsonString()); } catch { } }
     void Toast(string text, bool error = false) => Send(new JsonObject { ["type"] = "toast", ["text"] = text, ["error"] = error });
 
+    string lastInbox = "";
+    static string InboxSig() => string.Join(",", Inbox.Load().Select(p => p.Id));
+
+    // What Planner.Snapshot doesn't carry: each task's link (a local-only field) and the inbox proposals.
+    void AddAssistant(JsonObject o)
+    {
+        var live = Planner.Live().ToDictionary(i => i.Id, i => i);
+        foreach (var t in o["tasks"].AsArray())
+            if (live.TryGetValue((string)t["id"], out var it) && !string.IsNullOrEmpty(it.Link)) t["link"] = it.Link;
+        var inbox = new JsonArray();
+        var props = Inbox.Load();
+        lastInbox = string.Join(",", props.Select(p => p.Id));
+        foreach (var p in props)
+            inbox.Add(new JsonObject
+            {
+                ["id"] = p.Id, ["kind"] = p.Kind, ["title"] = p.Title, ["due"] = p.Start?.ToString("yyyy-MM-dd"), ["time"] = p.Kind == "event" && !p.AllDay && p.Start != null ? p.Start.Value.ToString("h:mm tt") : "",
+                ["cat"] = p.Cat ?? "", ["source"] = p.Source ?? "", ["why"] = p.Why ?? "", ["link"] = !string.IsNullOrEmpty(p.Link),
+            });
+        o["inbox"] = inbox;
+    }
+
+    // The link icon on a task: open its URL (or file) with the default app. Looked up by id so the page can't ask for any other address.
+    void OpenLink(string id)
+    {
+        string link = Planner.Live().FirstOrDefault(i => i.Id == id)?.Link ?? Inbox.Load().FirstOrDefault(p => p.Id == id)?.Link ?? "";
+        if (link.Length == 0) return;
+        bool web = link.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || link.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        if (!web && !File.Exists(link) && !Directory.Exists(link)) { Toast("I can't open that link", true); return; }
+        try { Process.Start(new ProcessStartInfo(link) { UseShellExecute = true }); } catch (Exception ex) { Toast("Couldn't open it: " + ex.Message, true); }
+    }
+
     JsonObject GoogleJson() => new() { ["connected"] = GoogleSync.Connected, ["hasClient"] = GoogleSync.HasClient, ["status"] = GoogleSync.Status };
 
     void Push()
     {
         seen = Planner.LastWrite;
         var o = Planner.Snapshot(from, to);
+        AddAssistant(o);
         o["google"] = GoogleJson();
         lastGoogle = GoogleSync.Status;
         Send(o);
@@ -122,7 +154,7 @@ sealed class PlanForm : Form
     {
         if (!ready) return;
         if (GoogleSync.Connected && DateTime.Now - lastSync > TimeSpan.FromSeconds(60)) { lastSync = DateTime.Now; _ = GoogleSync.SyncNowAsync(); }
-        if (Planner.LastWrite != seen || GoogleSync.Status != lastGoogle) Push();
+        if (Planner.LastWrite != seen || GoogleSync.Status != lastGoogle || InboxSig() != lastInbox) Push();      // the daemon fills the inbox without touching the planner file
         await Task.CompletedTask;
     }
 
@@ -169,6 +201,19 @@ sealed class PlanForm : Form
                 break;
             }
             case "save": Save(m); Push(); break;
+            case "openlink": OpenLink((string)m["id"]); break;
+            case "inbox-accept":
+                Toast(Inbox.Accept((string)m["id"]) != null ? "Added to your planner" : "That one is already gone");
+                Push();
+                break;
+            case "inbox-dismiss": Inbox.Dismiss((string)m["id"]); Toast("Dismissed"); Push(); break;
+            case "inbox-all":
+            {
+                int n = Inbox.AcceptAll();
+                Toast(n == 0 ? "Nothing in the inbox" : $"Added {n} to your planner");
+                Push();
+                break;
+            }
             case "toggle":
             {
                 string id = (string)m["id"];
@@ -355,5 +400,12 @@ static class PlanShot
         Planner.AddTask("Pay rent", t.AddDays(2), "", new Rule { Freq = "MONTHLY" }, "Personal", 3);
         Planner.AddTask("Read chapter 7", t.AddDays(3), "", null, "School", 1);
         Planner.AddTask("Renew passport", null, "", null, "Personal");
+        Planner.Update(Planner.AddTask("Quiz 3: signals", t.AddDays(2), "Due 11:59 PM", null, "School").Id, x => { x.Link = "https://example.com/quiz3"; x.Source = "feed:demo"; });
+        Inbox.Add(new[]
+        {
+            new Proposal { Title = "Send the slides to Sam", Start = t.AddDays(2), Source = "dictation", Why = "I'll send Sam the slides by Friday" },
+            new Proposal { Title = "Read chapter 8", Start = t.AddDays(4), Cat = "School", Source = "lecture", Why = "for next week, read chapter 8", Link = "https://example.com/ch8" },
+            new Proposal { Title = "Group meeting", Kind = "event", Start = t.AddDays(3).AddHours(15), End = t.AddDays(3).AddHours(16), Source = "screen" },
+        });
     }
 }

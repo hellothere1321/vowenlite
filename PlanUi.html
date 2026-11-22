@@ -38,6 +38,19 @@ input, select, textarea { font: inherit; color: inherit; user-select: text; }
 .nav button.on { background: var(--s2); color: var(--ink); }
 .nav button .n { margin-left: auto; font-size: 12px; color: var(--faint); }
 .nav button .n.hot { color: var(--err); }
+.nav button .n.badge { min-width: 20px; padding: 0 7px; border-radius: 999px; background: var(--ice); color: #000; font-weight: 600; text-align: center; line-height: 20px; }
+.row .lk { width: 26px; height: 26px; border-radius: 50%; color: var(--faint); display: grid; place-items: center; flex: none; transition: background .15s var(--ease), color .15s var(--ease); }
+.row .lk:hover { background: var(--s3); color: var(--ice); }
+.row .lk svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ib { cursor: default; align-items: center; padding-top: 10px; padding-bottom: 10px; }
+.ib:hover { background: var(--s1); }
+.ib .b { flex: 1 1 auto; min-width: 0; }
+.ib .b .t { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib .b .s { color: var(--faint); font-size: 12.5px; margin-top: 2px; }
+.ib .b .w { color: var(--soft); font-size: 12.5px; margin-top: 4px; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib .acts { display: flex; gap: 6px; flex: none; }
+.ibbar { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; color: var(--soft); font-size: 13px; }
+.ibbar .sp { flex: 1; }
 .cap { padding: 22px 12px 8px; font: 600 10.5px var(--face); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
 .lists { overflow: auto; min-height: 0; flex: 1 1 auto; }
 .lists button { width: 100%; }
@@ -293,6 +306,8 @@ const ICON = {
   check: '<svg viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
   rep: '<svg viewBox="0 0 24 24"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',
   spark: '<svg viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/></svg>',
+  inbox: '<svg viewBox="0 0 24 24"><path d="M3 13h5l1.5 3h5L16 13h5"/><path d="M5.5 5h13L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z"/></svg>',
+  link: '<svg viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/></svg>',
 };
 
 // ---------------------------------------------------------------- state
@@ -357,8 +372,8 @@ function counts() {
 
 function renderChrome() {
   const c = counts();
-  const nav = [['today', 'Today', ICON.today, c.dueNow, c.late > 0], ['cal', 'Calendar', ICON.cal, '', false], ['tasks', 'Tasks', ICON.tasks, c.open, false], ['upcoming', 'Upcoming', ICON.up, '', false]];
-  $('#nav').innerHTML = nav.map(([k, l, i, n, hot]) => `<button data-act="nav" data-v="${k}" class="${S.view === k && !S.cat ? 'on' : ''}">${i}<span>${l}</span>${n !== '' && n !== 0 ? `<span class="n ${hot ? 'hot' : ''}">${n}</span>` : ''}</button>`).join('');
+  const nav = [['today', 'Today', ICON.today, c.dueNow, c.late > 0], ['cal', 'Calendar', ICON.cal, '', false], ['tasks', 'Tasks', ICON.tasks, c.open, false], ['upcoming', 'Upcoming', ICON.up, '', false], ['inbox', 'Inbox', ICON.inbox, (S.data.inbox || []).length, false, true]];
+  $('#nav').innerHTML = nav.map(([k, l, i, n, hot, badge]) => `<button data-act="nav" data-v="${k}" class="${S.view === k && !S.cat ? 'on' : ''}">${i}<span>${l}</span>${n !== '' && n !== 0 ? `<span class="n ${hot ? 'hot' : ''} ${badge ? 'badge' : ''}">${n}</span>` : ''}</button>`).join('');
   $('#lists').innerHTML = S.data.cats.length
     ? S.data.cats.map(k => `<button data-act="cat" data-v="${esc(k.name)}" class="${S.view === 'tasks' && S.cat === k.name ? 'on' : ''}" style="--c:${k.color}"><span class="dot"></span><span>${esc(k.name)}</span>${k.open ? `<span class="n">${k.open}</span>` : ''}</button>`).join('')
     : '<div class="none">Add <b style="color:var(--soft)">#school</b> to anything you type to start a list.</div>';
@@ -379,6 +394,7 @@ function titleFor() {
   if (S.view === 'today') return 'Today';
   if (S.view === 'tasks') return S.cat ? `<em>List ·</em> ${esc(S.cat)}` : 'Tasks';
   if (S.view === 'upcoming') return 'Upcoming';
+  if (S.view === 'inbox') return 'Inbox';
   if (S.cal === 'month') return `${MON[a.getMonth()]} <em>${a.getFullYear()}</em>`;
   if (S.cal === 'week') { const f = weekStart(a), l = addDays(f, 6); return f.getMonth() === l.getMonth() ? `${MON[f.getMonth()]} ${f.getDate()}–${l.getDate()} <em>${l.getFullYear()}</em>` : `${MON[f.getMonth()].slice(0, 3)} ${f.getDate()} – ${MON[l.getMonth()].slice(0, 3)} ${l.getDate()} <em>${l.getFullYear()}</em>`; }
   return `${DOW[a.getDay()]} <em>${MON[a.getMonth()].slice(0, 3)} ${a.getDate()}</em>`;
@@ -442,6 +458,7 @@ function metaOf(t) {
 function taskRow(t) {
   return `<div class="row ${t.done ? 'done' : ''}" data-act="edit-task" data-id="${t.id}" style="--pc:${t.prio === 3 ? 'var(--err)' : t.prio === 2 ? 'var(--warn)' : 'var(--faint)'}">
     <span class="ck" data-act="toggle" data-id="${t.id}">${ICON.check}</span><span class="t">${esc(t.title)}</span><span class="m">${prDot(t)}${metaOf(t)}</span>
+    ${t.link ? `<button class="lk" data-act="openlink" data-id="${t.id}" title="Open link">${ICON.link}</button>` : ''}
     <button class="x" data-act="del-task" data-id="${t.id}" title="Delete">${ICON.x}</button></div>`;
 }
 function evRow(e, past) {
@@ -458,7 +475,7 @@ let lastHtml = '', lastHtmlView = '';
 function renderView(quiet) {
   const v = $('#view');
   v.classList.toggle('flush', S.view === 'cal');
-  const html = { today: viewToday, cal: viewCal, tasks: viewTasks, upcoming: viewUpcoming }[S.view]();
+  const html = { today: viewToday, cal: viewCal, tasks: viewTasks, upcoming: viewUpcoming, inbox: viewInbox }[S.view]();
   const key = S.view + (S.cat || '') + S.cal;
   if (quiet === true && html === lastHtml && key === lastHtmlView) return;
   lastHtml = html; lastHtmlView = key;
@@ -528,6 +545,24 @@ function viewUpcoming() {
   }
   if (!any) h += '<div class="empty" style="font-size:15px;padding-top:30px">Nothing coming up in the next three weeks.</div>';
   return h + '</div>';
+}
+
+function sourceOf(s) {
+  if (!s) return '';
+  if (s.startsWith('feed:')) return 'Calendar feed';
+  return { screen: 'From your screen', dictation: 'From dictation', lecture: 'From a lecture', syllabus: 'From a syllabus' }[s] || s;
+}
+function viewInbox() {
+  const list = S.data.inbox || [];
+  if (!list.length) return '<div class="fade"><div class="empty" style="font-size:15px;padding-top:30px">Inbox is empty. Suggestions from “plan this”, lectures and your calendar feeds land here for a yes or no.</div></div>';
+  const rows = list.map(p => {
+    const when = p.due ? dayWord(pd(p.due)) + (p.time ? ' · ' + p.time : '') : 'No date';
+    const sub = [when, p.kind === 'event' ? 'Event' : '', p.cat, sourceOf(p.source)].filter(Boolean).join(' · ');
+    return `<div class="row ib" data-id="${p.id}"><div class="b"><div class="t">${esc(p.title)}</div><div class="s">${esc(sub)}</div>${p.why ? `<div class="w" title="${esc(p.why)}">“${esc(p.why.replace(/^[“"]|[”"]$/g, ''))}”</div>` : ''}</div>
+      ${p.link ? `<button class="lk" data-act="openlink" data-id="${p.id}" title="Open link">${ICON.link}</button>` : ''}
+      <div class="acts"><button class="pill sm primary" data-act="inbox-accept" data-id="${p.id}">Accept</button><button class="pill sm ghost" data-act="inbox-dismiss" data-id="${p.id}">Dismiss</button></div></div>`;
+  }).join('');
+  return `<div class="fade"><div class="ibbar"><span>${list.length} suggestion${list.length === 1 ? '' : 's'} waiting for a yes</span><span class="sp"></span><button class="pill sm" data-act="inbox-all">Accept all</button></div>${rows}</div>`;
 }
 
 // ---------------------------------------------------------------- calendar
@@ -820,6 +855,9 @@ document.addEventListener('click', e => {
     case 'goday': stop(); S.anchor = pd(el.dataset.d); S.view = 'cal'; S.cal = 'day'; S.cat = null; requestRange(true); renderChrome(); renderView(); break;
     case 'cellnew': if (e.target.closest('.chipev,.more,.dn')) return; if (el.dataset.all) newItem({ kind: 'event', date: el.dataset.d, allDay: true }); else newItem({ kind: 'event', date: el.dataset.d, st: '09:00', et: '10:00' }); break;
     case 'toggle': stop(); post({ cmd: 'toggle', id }); break;
+    case 'openlink': stop(); post({ cmd: 'openlink', id }); break;
+    case 'inbox-accept': case 'inbox-dismiss': stop(); post({ cmd: a, id }); break;
+    case 'inbox-all': stop(); post({ cmd: 'inbox-all' }); break;
     case 'del-task': stop(); post({ cmd: 'delete', id, scope: 'all' }); break;
     case 'edit-task': editItem('task', id); break;
     case 'edit-ev': stop(); editItem('event', id, el.dataset.occ); break;
