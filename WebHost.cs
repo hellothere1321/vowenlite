@@ -12,7 +12,8 @@ namespace VowenLite;
 // off every monitor: never on the taskbar or Alt+Tab, never activated, but "visible" so pages render and screenshots work (Chromium's
 // occlusion throttling is switched off). Its own profile in <data>\browser-profile. Commands come one at a time over a named pipe that
 // only this Windows account can open; each runs to completion on the UI thread, so a vault login (fill -> submit -> clear) is atomic.
-// Element refs live in an isolated script world the page can't see or tamper with. Quits after 3 minutes without a command.
+// Element refs live in an isolated script world the page can't see or tamper with. Stays up 2 hours after the last command: session
+// cookies (most school / SSO sign-ins) live only in this process, so quitting after a few idle minutes signed the user out between requests.
 sealed class WebHost : Form
 {
     sealed class Tab
@@ -20,10 +21,15 @@ sealed class WebHost : Form
         public CoreWebView2Controller C;
         public CoreWebView2 W => C.CoreWebView2;
         public int Ctx, Starts, Ends;
-        public string LastError;
+        public string LastError, NavUri;
+        public ulong NavId;
+        public Tab Opener;                         // the tab whose page opened this one as a pop-up (focus goes back there when it closes itself)
     }
 
-    static readonly TimeSpan Idle = TimeSpan.FromMinutes(3);
+    // KeepAlive is how long sessions survive between requests; after Doze idle minutes the tabs drop to low memory until the next command.
+    // Scratch-folder tests (VOWENLITE_DATA set) keep the old 3 minutes so a test host never lingers for hours and locks out\.
+    static readonly TimeSpan KeepAlive = TimeSpan.FromHours(2), Doze = TimeSpan.FromMinutes(5);
+    static readonly TimeSpan Idle = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VOWENLITE_DATA")) ? KeepAlive : TimeSpan.FromMinutes(3);
     const int MaxTabs = 6, TextChunk = 5000, VW = 1280, VH = 900;
     readonly List<Tab> tabs = new();
     readonly List<string> secrets = new();         // vault values used in this process: scrubbed from every reply
@@ -32,6 +38,7 @@ sealed class WebHost : Form
     Tab cur;
     GuardProxy proxy;                              // H1: every request the browser makes is forced through this loopback proxy, which re-resolves and refuses private IPs
     bool loginBusy;                                // M1: a sign-in owns the browser start-to-finish; every other command is refused meanwhile
+    bool replyHandoff;                             // this command put the sign-in window on the user's screen (tells the daemon to wait for it)
     DateTime lastCmd = DateTime.UtcNow, lastSweep = DateTime.MinValue;
     // Tests only: https://login.vltest.example etc. served from a folder. Honoured ONLY when the test harness set VOWENLITE_WEBTEST=1,
     // so a stray VOWENLITE_WEB_TESTDIR in a production environment can never redirect the real browser to a local folder.
@@ -65,28 +72,50 @@ sealed class WebHost : Form
             done.Enabled = false;
             done.Text = "Returning to Luna…";
             await Task.Delay(400);
-            if (userMode && userSince == began) FinishHandoff(true);
+            if (userMode && userSince == began) FinishHandoff(true, "button");
         };
         bar = new Panel { Dock = DockStyle.Top, Height = BarH, Visible = false, BackColor = Color.FromArgb(32, 34, 40) };
         bar.Controls.Add(done);
-        bar.Controls.Add(new Label { Text = "Sign in here yourself, then press the button. Luna never sees what you type.", ForeColor = Color.White, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 0, 0) });
+        hint = new Label { Text = HintText, ForeColor = Color.White, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 0, 0) };
+        bar.Controls.Add(hint);
         Controls.Add(bar);
         var idle = new System.Windows.Forms.Timer { Interval = 10_000 };
         idle.Tick += (_, _) =>
         {
-            if (userMode) { if (DateTime.UtcNow - userSince > WebBridge.HandoffLimit) FinishHandoff(false); return; }
-            if (DateTime.UtcNow - lastCmd > Idle) Close();
+            if (userMode) return;   // the sign-in watch (below) owns the clock while the user has the window
+            var quiet = DateTime.UtcNow - lastCmd;
+            if (quiet > Idle) Close();
+            else if (quiet > Doze) SetDoze(true);
         };
         idle.Start();
+        watch.Tick += async (_, _) => await Watch();
+    }
+
+    // ---- low memory while idle: the host now lives for hours, so between requests its tabs are told to give memory back
+    bool dozing;
+    void SetDoze(bool on)
+    {
+        if (dozing == on) return;
+        dozing = on;
+        foreach (var t in tabs) try { t.W.MemoryUsageTargetLevel = on ? CoreWebView2MemoryUsageTargetLevel.Low : CoreWebView2MemoryUsageTargetLevel.Normal; } catch { }
     }
 
     // ---- hand the browser to the user: on screen, activatable, with a "signed in" bar. Same profile, so the session stays for Luna.
     const int BarH = 40;
+    const string HintText = "Sign in here yourself, then press the button. Luna never sees what you type.";
     readonly Panel bar;
     readonly Button done;
+    readonly Label hint;
     bool userMode;
     bool handoffReturned;
+    string handoffHow = "";
     DateTime userSince;
+    // Sign-in detection while the user has the window (people often never see the button): once a sign-in page has been seen (password
+    // box, sign-in address, embedded sign-in frame, code/CAPTCHA text), the first settled page showing none of those for 3 polls in a row
+    // counts as signed in and the browser goes back to Luna by itself.
+    readonly System.Windows.Forms.Timer watch = new() { Interval = 1000 };
+    bool sawSignin, looksDone, nudged, probing;
+    int clearPolls;
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
 
@@ -94,11 +123,17 @@ sealed class WebHost : Form
     {
         if (userMode == on) return;
         userMode = on; userSince = DateTime.UtcNow; lastCmd = DateTime.UtcNow;
+        sawSignin = looksDone = nudged = false; clearPolls = 0;
         if (on)
         {
             done.Text = "I'm signed in";
             done.Enabled = true;
+            hint.Text = HintText;
+            SetDoze(false);
+            watch.Start();
         }
+        else watch.Stop();
+        if (TestDir != null) return;   // tests: the "sign-in window" stays off-screen and never activates (nothing may appear on the user's screen)
         int ex = GetWindowLong(Handle, -20);
         if (on)
         {
@@ -122,21 +157,84 @@ sealed class WebHost : Form
         }
     }
 
-    void FinishHandoff(bool returned)
+    (int, string) HandoffResult() => handoffReturned ? (0, $"browser returned ({handoffHow})") : (1, $"sign-in window closed without signing in ({handoffHow})");
+
+    void FinishHandoff(bool returned, string how)
     {
-        handoffReturned = returned;
+        if (!userMode) return;
+        handoffReturned = returned; handoffHow = how;
+        Log($"web host: sign-in window handed back ({how}, {(returned ? "continuing" : "not signed in")}) after {(int)(DateTime.UtcNow - userSince).TotalSeconds} s");
         UserMode(false);
     }
 
+    // Alt+F4 / a close from the taskbar: if the page already looks signed in, that is as good as the button.
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         base.OnFormClosing(e);
         if (userMode && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
-            FinishHandoff(false);
+            FinishHandoff(looksDone, "window closed");
         }
     }
+
+    // Puts the current tab on the user's screen for them to sign in (the `handoff` command, or `login` on an embedded sign-in form).
+    (int, string) StartHandoff(string reply)
+    {
+        handoffReturned = false; handoffHow = "";
+        UserMode(true);
+        replyHandoff = true;
+        return (0, reply);
+    }
+
+    async Task Watch()
+    {
+        if (!userMode || probing) return;
+        probing = true;
+        try
+        {
+            var since = DateTime.UtcNow - userSince;
+            if (since > WebBridge.HandoffLimit + TimeSpan.FromMinutes(2)) { FinishHandoff(looksDone, "timed out"); return; }   // the daemon stopped waiting
+            if (!nudged && since > WebBridge.HandoffNudge) { nudged = true; hint.Text = "Still waiting: sign in, then press \"I'm signed in\" (or click Luna's working card to stop)."; }
+            var t = cur;
+            bool? signals = await SigninSignals(t);
+            if (!userMode || signals == null) return;   // mid-navigation or no answer: don't count this poll either way
+            if (signals == true) { sawSignin = true; looksDone = false; clearPolls = 0; if (hint.Text.StartsWith("Looks")) hint.Text = HintText; return; }
+            if (!sawSignin || t.Starts > t.Ends || t.LastError != null) { clearPolls = 0; return; }   // an error page is not "signed in"
+            looksDone = true;
+            if (++clearPolls == 1) hint.Text = "Looks signed in: handing the browser back to Luna…";
+            if (clearPolls >= 3) FinishHandoff(true, "sign-in detected");
+        }
+        catch { }
+        finally { probing = false; }
+    }
+
+    // true = this page is (part of) a sign-in; false = it isn't; null = couldn't tell yet (loading, navigating, script failed).
+    async Task<bool?> SigninSignals(Tab t)
+    {
+        try
+        {
+            using var j = JsonDocument.Parse(await Eval(t, ProbeJs));
+            var r = j.RootElement;
+            if (Str(r, "ready") != "complete" || !Regex.IsMatch(Str(r, "url"), "^https?://")) return null;
+            var frames = r.GetProperty("frames").EnumerateArray().Select(f => (Str(f, "src"), Str(f, "hint"))).ToList();
+            return Signals(Str(r, "url"), r.GetProperty("pw").GetBoolean(), Str(r, "text"), frames);
+        }
+        catch { return null; }
+    }
+
+    // Pure (also checked by `--webtest selftest`): a sign-in address, a visible password box, an embedded sign-in frame or code/CAPTCHA text.
+    internal static bool Signals(string url, bool pw, string text, IEnumerable<(string Src, string Hint)> frames) =>
+        pw || SigninUrl(url) || Regex.IsMatch(text ?? "", CheckRx, RegexOptions.IgnoreCase) || frames.Any(SigninFrame);
+
+    internal static bool SigninFrame((string Src, string Hint) f) => SigninUrl(f.Src) || SigninHint.IsMatch(f.Hint ?? "");
+
+    // Hosts and paths of sign-in pages: identity providers (Microsoft, Google, Okta, Duo, Shibboleth/CAS/ADFS at schools) and the usual /login paths.
+    static readonly Regex SigninHost = new(@"(?:^|[.-])(?:log-?in|logon|sign-?in|signon|sso|auth|oauth|idp|adfs|cas|shib(?:boleth)?|webauth|weblogin|sts|mfa|duo|duosecurity|okta|onelogin|auth0|pingone|pingidentity|microsoftonline|accounts)(?:$|[.-])", RegexOptions.IgnoreCase);
+    static readonly Regex SigninPath = new(@"(?:^|[/?&=._-])(?:log[-_]?in|log[-_]?on|sign[-_]?in|sign[-_]?on|sso|saml2?|oauth2?|openid|authorize|authenticate|auth|idp|adfs|cas|shibboleth|mfa|2fa|kmsi|webauth|weblogin)(?:$|[/?&=._#-])", RegexOptions.IgnoreCase);
+    static readonly Regex SigninHint = new(@"log ?[io]n|sign ?[io]n|\bsso\b|\bauth(?:\b|entic|oriz)", RegexOptions.IgnoreCase);
+    internal static bool SigninUrl(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var u) && (u.Scheme == "https" || u.Scheme == "http") && (SigninHost.IsMatch(u.Host) || SigninPath.IsMatch(u.PathAndQuery));
 
     void Fit(int w, int h) { foreach (var t in tabs) t.C.Bounds = new Rectangle(0, userMode ? BarH : 0, w, h); }
 
@@ -179,26 +277,55 @@ sealed class WebHost : Form
         {
             string why = Blocked(e.Uri);
             if (why != null) { e.Cancel = true; t.LastError = why; notes.Add("blocked navigation to " + Trim(e.Uri, 80) + ": " + why); return; }
-            t.Starts++;
+            t.Starts++; t.NavId = e.NavigationId; t.NavUri = e.Uri; t.LastError = null;   // redirects start again here, so NavUri ends up as the address that failed
         };
         t.W.NavigationCompleted += (_, e) =>
         {
+            // Only the latest navigation counts: a superseded one (a script redirect during load) or one refused above reports "canceled"
+            // after the next one started, which marked the page settled too early and left a stale "navigation failed".
+            if (e.NavigationId != t.NavId) return;
             t.Ends = t.Starts;
-            if (!e.IsSuccess) t.LastError = e.WebErrorStatus.ToString();
+            // a refusal by the guard proxy only shows up as a generic network error: put its real reason ("blocked on this PC ...") in its place
+            // (a redirect refused in NavigationStarting already set its own reason, and keeps it)
+            t.LastError = e.IsSuccess ? null : t.LastError ?? (Uri.TryCreate(t.NavUri, UriKind.Absolute, out var nu) ? proxy?.Why(nu.Host) : null) ?? e.WebErrorStatus.ToString();
             try { var u = new Uri(t.W.Source); if (u.Scheme == "https" || u.Scheme == "http") Vault.NoteSite(Vault.Site(u.Host), u.GetLeftPart(UriPartial.Authority)); } catch { }
         };
         t.W.ContentLoading += (_, _) => t.Ctx = 0;
         t.W.DownloadStarting += (_, e) => { e.Cancel = true; notes.Add("a download (" + Path.GetFileName(e.ResultFilePath) + ") was blocked: downloads are off"); };
         t.W.PermissionRequested += (_, e) => e.State = CoreWebView2PermissionState.Deny;
         t.W.BasicAuthenticationRequested += (_, e) => { e.Cancel = true; notes.Add("the site asked for a browser login box; that needs the user"); };
-        t.W.ScriptDialogOpening += (_, e) => { notes.Add($"page {e.Kind.ToString().ToLowerInvariant()}: \"{Trim(e.Message, 200)}\"" + (e.Kind == CoreWebView2ScriptDialogKind.Alert ? " (closed)" : " (dismissed)")); if (e.Kind == CoreWebView2ScriptDialogKind.Alert) e.Accept(); };
+        // Alerts are closed; a "leave this page?" prompt is answered yes (whoever navigated meant to leave, and left unanswered it silently
+        // cancels the navigation); confirm/prompt are dismissed.
+        t.W.ScriptDialogOpening += (_, e) =>
+        {
+            bool yes = e.Kind is CoreWebView2ScriptDialogKind.Alert or CoreWebView2ScriptDialogKind.Beforeunload;
+            notes.Add($"page {e.Kind.ToString().ToLowerInvariant()}: \"{Trim(e.Message, 200)}\"" + (e.Kind == CoreWebView2ScriptDialogKind.Beforeunload ? " (left the page)" : yes ? " (closed)" : " (dismissed)"));
+            if (yes) e.Accept();
+        };
         t.W.NewWindowRequested += async (_, e) =>
         {
             if (Blocked(e.Uri) is string why) { e.Handled = true; notes.Add("blocked popup: " + why); return; }
-            if (tabs.Count >= MaxTabs) { e.Handled = true; t.W.Navigate(e.Uri); return; }
             var def = e.GetDeferral();
-            try { var nt = await NewTab(); e.NewWindow = nt.W; e.Handled = true; Activate(nt); notes.Add($"the page opened a new tab (now tab {tabs.IndexOf(nt) + 1})"); }
+            try
+            {
+                // Full: close the oldest other tab rather than loading the pop-up over this page (a pop-up that is filled by script, as
+                // PeopleSoft and print views do, would leave this tab blank). Never during a sign-in, which owns its tabs.
+                if (tabs.Count >= MaxTabs && !loginBusy && tabs.FirstOrDefault(x => x != t && x != cur) is Tab old) { tabs.Remove(old); try { old.C.Close(); } catch { } notes.Add("closed the oldest tab to make room"); }
+                if (tabs.Count >= MaxTabs) { e.Handled = true; t.W.Navigate(e.Uri); return; }
+                var nt = await NewTab(); nt.Opener = t; e.NewWindow = nt.W; e.Handled = true; Activate(nt); notes.Add($"the page opened a new tab (now tab {tabs.IndexOf(nt) + 1})");
+            }
             finally { def.Complete(); }
+        };
+        // A pop-up that closes itself (SSO and PeopleSoft windows do, once done) used to stay on top as a blank tab, hiding the page that opened it.
+        t.W.WindowCloseRequested += async (_, _) =>
+        {
+            if (loginBusy || !tabs.Contains(t)) return;   // a sign-in owns its tabs until it finishes
+            bool wasCur = cur == t;
+            tabs.Remove(t);
+            try { t.C.Close(); } catch { }
+            if (tabs.Count == 0) await NewTab();
+            else if (wasCur) Activate(t.Opener != null && tabs.Contains(t.Opener) ? t.Opener : tabs[^1]);
+            notes.Add($"a pop-up tab closed itself; now on tab {tabs.IndexOf(cur) + 1}: {Trim(cur.W.DocumentTitle, 60)} — {cur.W.Source}");
         };
         // Sub-requests to this PC / the local network are refused (so no page can reach the bridges or the router); main-frame checks are in Blocked.
         foreach (var pat in PrivatePatterns) t.W.AddWebResourceRequestedFilter(pat, CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.All);
@@ -274,17 +401,28 @@ sealed class WebHost : Form
         return b[0] == 10 || b[0] == 127 || b[0] == 0 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254) || (b[0] == 100 && b[1] >= 64 && b[1] <= 127) || b[0] >= 224;
     }
 
-    // A public-looking name that resolves to this PC / the LAN (e.g. "localtest.me") is refused too.
+    // A public-looking name that resolves to this PC / the LAN (e.g. "localtest.me") is refused too. A failed lookup is left to the browser.
     static string ResolvesPrivate(string host)
     {
         if (IPAddress.TryParse(host.Trim('[', ']'), out _) || (TestDir != null && host.EndsWith(".example"))) return null;
         try
         {
             var t = Dns.GetHostAddressesAsync(host);
-            if (t.Wait(2500) && t.Result.Any(PrivateIp)) return "that name points at this PC or the local network, which is off limits";
+            if (t.Wait(2500) && t.Result.Length > 0) return RefuseReason(host, t.Result);
         }
         catch { }
         return null;
+    }
+
+    // Why a name's addresses can't be used (null = all public). Refuses exactly what PrivateIp refuses, but names the real cause: a name
+    // that resolves to 0.0.0.0 / :: is blocked on this PC (hosts file or a blocker app), which Luna should tell the user as such.
+    internal static string RefuseReason(string host, IPAddress[] addrs)
+    {
+        if (addrs == null || addrs.Length == 0) return $"{host} can't be found (the name doesn't resolve)";
+        var blocked = addrs.Select(a => a.IsIPv4MappedToIPv6 ? a.MapToIPv4() : a).Where(a => a.Equals(IPAddress.Any) || a.Equals(IPAddress.IPv6Any))
+            .Distinct().OrderBy(a => a.AddressFamily).ToList();
+        if (blocked.Count > 0) return $"{host} is blocked on this PC (it resolves to {string.Join("/", blocked)}; usually the Windows hosts file or a blocker app does that)";
+        return addrs.Any(PrivateIp) ? $"{host} points at this PC or the local network, which is off limits" : null;
     }
 
     // ---- the pipe
@@ -301,14 +439,15 @@ sealed class WebHost : Form
                 var w = new StreamWriter(ps, new UTF8Encoding(false)) { AutoFlush = true };
                 string line = rd.ReadLine();
                 if (line == null) continue;
-                var done = new TaskCompletionSource<(int, string)>();
+                var done = new TaskCompletionSource<(int, string, bool)>();
                 BeginInvoke(new Action(async () =>
                 {
-                    try { done.SetResult(await RunLine(line)); }
-                    catch (Exception ex) { Log("web host: command failed: " + ex.Message); done.TrySetResult((125, "browser error: " + ex.Message)); }
+                    replyHandoff = false;
+                    try { var (x, s) = await RunLine(line); done.TrySetResult((x, s, replyHandoff)); }
+                    catch (Exception ex) { Log("web host: command failed: " + ex.Message); done.TrySetResult((125, "browser error: " + ex.Message, replyHandoff)); }
                 }));
-                var (exit, o) = done.Task.Wait(120_000) ? done.Task.Result : (124, "the browser took too long");
-                w.WriteLine(JsonSerializer.Serialize(new { exit, @out = Scrub(o, secrets) }));
+                var (exit, o, handoff) = done.Task.Wait(120_000) ? done.Task.Result : (124, "the browser took too long", false);
+                w.WriteLine(JsonSerializer.Serialize(new { exit, @out = Scrub(o, secrets), handoff }));
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException) { if (IsDisposed) return; Thread.Sleep(100); }
         }
@@ -337,12 +476,14 @@ sealed class WebHost : Form
         string cmd = d.RootElement.GetProperty("cmd").GetString();
         var a = d.RootElement.GetProperty("args").EnumerateArray().Select(x => x.GetString() ?? "").ToList();
         string text = d.RootElement.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String ? tx.GetString() : null;
-        if (cmd == "handoff-status") return userMode ? (75, "waiting for sign-in")
-            : handoffReturned ? (0, "browser returned") : (1, "sign-in window closed or timed out");
-        if (cmd == "handoff-cancel") { FinishHandoff(false); return (0, "sign-in cancelled"); }
-        if (userMode) return (126, "the user is signing in");
-        if (DateTime.UtcNow - lastSweep > TimeSpan.FromMinutes(1)) await Sweep(false);
+        if (cmd == "handoff-status") return userMode ? (75, "waiting for sign-in") : HandoffResult();
+        if (cmd == "handoff-cancel") { FinishHandoff(false, "cancelled"); return (0, "sign-in cancelled"); }
+        if (cmd == "handoff-finish") { FinishHandoff(looksDone, "the app stopped waiting"); return HandoffResult(); }   // daemon's wait ran out: continue only if it looks signed in
+        if (cmd == "quit") { var q = new System.Windows.Forms.Timer { Interval = 300 }; q.Tick += (_, _) => Close(); q.Start(); return (0, "the background browser is closing"); }   // after the reply is out
+        if (userMode) return (126, "the user is signing in in the browser window; try again when they're done");
+        SetDoze(false);
         notes.Clear();
+        if (DateTime.UtcNow - lastSweep > TimeSpan.FromMinutes(1)) await Sweep(false);
         var (exit, o) = await Do(cmd, a, text);
         lastCmd = DateTime.UtcNow;
         if (notes.Count > 0) o += "\n[" + string.Join("; ", notes.Distinct()) + "]";
@@ -459,6 +600,14 @@ sealed class WebHost : Form
                 Activate(tabs[n - 1]);
                 return (0, $"tab {n}: {Trim(cur.W.DocumentTitle, 80)} — {cur.W.Source}");
             }
+            case "close" when a.Count > 0 && a[0].Equals("all", StringComparison.OrdinalIgnoreCase):
+            {
+                // every tab goes; the process (and so every sign-in) stays for the next request
+                int shown = tabs.Count(x => x.W.Source != "about:blank");
+                foreach (var x in tabs.ToList()) { tabs.Remove(x); try { x.C.Close(); } catch { } }
+                await NewTab();
+                return (0, shown == 0 ? "no tabs were open" : $"closed {shown} tab{(shown == 1 ? "" : "s")}");
+            }
             case "close":
             {
                 int n = a.Count > 0 && int.TryParse(a[0], out int v) ? v : tabs.IndexOf(cur) + 1;
@@ -478,12 +627,10 @@ sealed class WebHost : Form
                     t.LastError = null;
                     await Nav(t, () => t.W.Navigate(url), 30_000);
                 }
-                handoffReturned = false;
-                UserMode(true);
-                return (0, "Sign-in window opened. VowenLite will continue the original request when the user returns the browser.");
+                return StartHandoff("Sign-in window opened on the user's screen. End your turn now; VowenLite continues the original request by itself once they have signed in.");
             }
         }
-        return (2, $"unknown command \"{cmd}\" (open, read, click, type, key, scroll, back, wait, shot, tabs, tab, close, login, logins, handoff)");
+        return (2, $"unknown command \"{cmd}\" (open, read, click, type, key, scroll, back, wait, shot, tabs, tab, close, close all, login, logins, handoff)");
     }
 
     static readonly Regex FinalAction = new(@"^\s*(?:pay|buy|place (?:your )?order|purchase|complete (?:purchase|order|payment)|confirm (?:purchase|order|payment)|submit (?:order|payment)|buy now|pay now|checkout now|subscribe now)\b", RegexOptions.IgnoreCase);
@@ -598,7 +745,7 @@ sealed class WebHost : Form
 };
 var __vis = (e) => { const r = e.getBoundingClientRect(); if (r.width < 2 || r.height < 2) return false; const s = getComputedStyle(e); return s.visibility !== 'hidden' && s.display !== 'none' && +s.opacity > 0.05; };
 var __docs = () => { const out = [document]; for (let i = 0; i < out.length && out.length < 12; i++) for (const f of out[i].querySelectorAll('iframe,frame')) { try { if (f.contentDocument && f.contentWindow.location.protocol === location.protocol) out.push(f.contentDocument); } catch (e) {} } return out; };
-";
+" + XFramesJs;
 
     const string ReadJs = @"(() => {
   const sel = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[role=combobox],[role=textbox],[role=searchbox],[contenteditable=""""],[contenteditable=true]';
@@ -631,21 +778,44 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
   const pages = [];
   for (const d of __docs()) if (d.body) { pages.push(d.body.innerText); walk(d.body, false); }
   window.__vl = els;
-  return JSON.stringify({ title: document.title, url: location.href, text: pages.join('\n') + '\n' + text.join(''), list: els.map((e, i) => Object.assign({ i: i + 1 }, __d(e))) });
+  return JSON.stringify({ title: document.title, url: location.href, text: pages.join('\n') + '\n' + text.join(''), list: els.map((e, i) => Object.assign({ i: i + 1 }, __d(e))), frames: __xframes().map(f => f.src) });
+})()";
+
+    // Visible frames from another site (their content is out of reach here): src + title/name/id, for sign-in detection and for `read` to point at.
+    const string XFramesJs = @"var __xframes = () => { const out = []; for (const d of __docs()) for (const f of d.querySelectorAll('iframe,frame')) {
+  let same = false; try { same = !!f.contentDocument; } catch (e) {}
+  if (same || !__vis(f)) continue; const r = f.getBoundingClientRect(); if (r.width < 150 || r.height < 100) continue;
+  out.push({ src: (f.src || '').slice(0, 300), hint: ((f.title || '') + ' ' + (f.name || '') + ' ' + (f.id || '')).slice(0, 120) }); if (out.length >= 6) break; } return out; };
+";
+
+    // Sign-in watch during a handoff: the page's address, load state, a visible password box, cross-site frames and the first of its text.
+    const string ProbeJs = @"(() => { let pw = false;
+  for (const d of __docs()) { for (const e of d.querySelectorAll('input[type=password]')) if (__vis(e)) { pw = true; break; } if (pw) break; }
+  return JSON.stringify({ url: location.href, ready: document.readyState, pw, frames: __xframes(), text: document.body ? document.body.innerText.slice(0, 3000) : '' });
 })()";
 
     async Task<(int, string)> Read(Tab t, int part)
     {
-        string raw = await Eval(t, ReadJs);
-        using var j = JsonDocument.Parse(raw);
+        string raw = null, text = "";
+        JsonDocument j = null;
+        // Script-built pages (PeopleSoft, SPAs) are often still empty right after the load event: give them a few seconds before reading "nothing".
+        for (int i = 0; i < 10; i++)
+        {
+            j?.Dispose();
+            raw = await Eval(t, ReadJs);
+            j = JsonDocument.Parse(raw);
+            text = Regex.Replace(Regex.Replace(Str(j.RootElement, "text").Replace("\r", ""), @"[ \t]+", " "), @"\n\s*\n+", "\n").Trim();
+            if (text.Length > 0 || j.RootElement.GetProperty("list").GetArrayLength() > 0 || t.LastError != null || Str(j.RootElement, "url").StartsWith("about:")) break;
+            await Task.Delay(400);
+        }
+        using var jd = j;
         var r = j.RootElement;
-        string text = Regex.Replace(Regex.Replace(Str(r, "text").Replace("\r", ""), @"[ \t]+", " "), @"\n\s*\n+", "\n").Trim();
         int parts = Math.Max(1, (text.Length + TextChunk - 1) / TextChunk);
         part = Math.Min(part, parts);
         string chunk = text.Length == 0 ? "(no visible text)" : text.Substring((part - 1) * TextChunk, Math.Min(TextChunk, text.Length - (part - 1) * TextChunk));
         var sb = new StringBuilder();
         sb.Append("Title: ").Append(Trim(Str(r, "title"), 120)).Append("\nURL: ").Append(Str(r, "url"));
-        if (t.LastError != null && Str(r, "url").StartsWith("about:")) sb.Append("\n(navigation failed: ").Append(t.LastError).Append(')');
+        if (t.LastError != null) sb.Append("\n(the last navigation failed: ").Append(t.LastError).Append(')');
         if (tabs.Count > 1) sb.Append($"\nTab {tabs.IndexOf(t) + 1} of {tabs.Count}");
         sb.Append($"\n\nText{(parts > 1 ? $" (part {part} of {parts}; `read {Math.Min(part + 1, parts)}` for more)" : "")}:\n").Append(chunk);
         if (part == 1)
@@ -653,6 +823,10 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
             var list = r.GetProperty("list").EnumerateArray().ToList();
             sb.Append("\n\nElements").Append(list.Count >= 250 ? " (first 250)" : "").Append(":\n");
             foreach (var e in list) sb.Append(Describe(e)).Append('\n');
+            var frames = r.GetProperty("frames").EnumerateArray().Select(f => f.GetString()).Where(f => f is { Length: > 0 } && !f.StartsWith("about:")).Distinct().ToList();
+            if (frames.Count > 0)
+                sb.Append("\nFrames from other sites (not readable from this page; `open` one to read it, or `handoff` if it is a sign-in form):\n")
+                  .Append(string.Join("\n", frames.Select(f => "  " + Trim(f, 150)))).Append('\n');
         }
         if (Regex.IsMatch(text, CheckRx, RegexOptions.IgnoreCase)) sb.Append("\n[this page may want a code, CAPTCHA or other check: that needs the user]");
         return (0, sb.ToString().TrimEnd());
@@ -717,18 +891,50 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
   return JSON.stringify({ top, user: !!user, userVal: user ? user.value : '', pass: !!pass, passFrame: pf, action, method, crossFrame: [...document.querySelectorAll('iframe')].some(f => { try { return !f.contentDocument; } catch (e) { return true; } }) });
 })()";
 
+    // Is there a sign-in form on the page itself (main page + same-site frames)? Plus the visible frames from other sites.
+    const string EmbeddedJs = @"(() => {
+  const ins = []; for (const d of __docs()) for (const e of d.querySelectorAll('input')) if (__vis(e) && !e.disabled) ins.push(e);
+  const form = ins.some(e => { const ty = (e.getAttribute('type') || '').toLowerCase();
+    return ty === 'password' || ty === 'email' || /username|email/.test(e.autocomplete || '') ||
+      (['text', ''].includes(ty) && /user|email|login|account|identifier/i.test((e.id || '') + ' ' + (e.name || '') + ' ' + (e.getAttribute('aria-label') || '') + ' ' + (e.placeholder || ''))); });
+  return JSON.stringify({ form, frames: __xframes() });
+})()";
+
+    // The host of the embedded sign-in frame when that is the page's only sign-in form, else null.
+    async Task<string> EmbeddedSignin(Tab t)
+    {
+        try
+        {
+            using var j = JsonDocument.Parse(await Eval(t, EmbeddedJs));
+            if (j.RootElement.GetProperty("form").GetBoolean()) return null;
+            foreach (var f in j.RootElement.GetProperty("frames").EnumerateArray())
+            {
+                string src = Str(f, "src");
+                if (SigninFrame((src, Str(f, "hint")))) return Uri.TryCreate(src, UriKind.Absolute, out var u) ? u.Host : "another site";
+            }
+        }
+        catch { }
+        return null;
+    }
+
     const string ClearPassJs = @"(() => { let n = 0; for (const d of __docs()) { for (const e of d.querySelectorAll('input[type=password]')) if (e.value) { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); n++; } } if (window.__vlLogin) window.__vlLogin = null; return String(n); })()";
 
     async Task<(int, string)> Login(Tab host, string siteArg)
     {
         Vault.Sweep();
-        await Sweep(false);
-        string pageSite = Uri.TryCreate(host.W.Source, UriKind.Absolute, out var pu) ? Vault.Site(pu.Host) : "";
+        string pageUrl = host.W.Source;
+        bool wiped = await Sweep(false);   // a wipe blanks the tabs: the vault checks below still report on the page that was open
+        // The only sign-in form here is inside a frame from another site: the vault never fills those, so instead of failing, put this page on
+        // the user's screen for them to sign in themselves (what the model would otherwise have to be told to do).
+        if (!wiped && await EmbeddedSignin(host) is string frameHost)
+            return StartHandoff($"The sign-in form on this page is embedded from {frameHost}, which the saved-login tool never fills, so the sign-in window is now open on the user's screen for them to sign in there. End your turn now without another tool call; VowenLite continues this request by itself once they're signed in.");
+        string pageSite = Uri.TryCreate(pageUrl, UriKind.Absolute, out var pu) ? Vault.Site(pu.Host) : "";
         string site = string.IsNullOrWhiteSpace(siteArg) ? pageSite : Vault.Site(siteArg);
         if (site.Length == 0) return (2, "open the site's sign-in page first, then run `login`.");
         var entry = Vault.Find(site);
         if (entry == null) return (3, $"no saved login for {site}: ask the user to add it (they can say \"open passwords\"). Don't ask them for the password.");
         if (entry.Expired) return (3, $"the saved login for {site} expired (logins last 7 days): ask the user to re-enter it in the vault (\"open passwords\").");
+        if (wiped) return (1, "the browser's saved sessions just reached the 7-day limit and were wiped, which reset the page: open the sign-in page again, then run `login`.");
         string eHost = string.IsNullOrEmpty(entry.Host) ? entry.Site : entry.Host;
         if (!Vault.EntryMatches(entry, host.W.Source)) return (126, $"refused: the open page ({Trim(host.W.Source, 80)}) is not an https page on {eHost}. Open {eHost}'s own sign-in page first.");
 
@@ -750,10 +956,10 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
                 var r = f.RootElement;
                 if (!Vault.EntryMatches(entry, Str(r, "top")) || !Vault.EntryMatches(entry, lt.W.Source)) { refusal = (126, $"refused: the page left {eHost}."); goto done; }
                 bool hasPass = r.GetProperty("pass").GetBoolean(), hasUser = r.GetProperty("user").GetBoolean();
-                if (hasPass && !Vault.EntryMatches(entry, Str(r, "passFrame"))) { refusal = (126, "refused: the password box is in a frame from another site. That needs the user."); goto done; }
+                if (hasPass && !Vault.EntryMatches(entry, Str(r, "passFrame"))) { refusal = (126, "refused: the password box is in a frame from another site, which the vault never fills. Run `handoff` now so the user signs in on their screen."); goto done; }
                 if (!hasPass && !hasUser)
                 {
-                    if (step == 0) { refusal = (1, r.GetProperty("crossFrame").GetBoolean() ? "the sign-in form is inside an embedded frame from another site, which the vault won't fill: that needs the user." : "no sign-in form on this page. Click the site's Sign in / Log in link first, then run `login`."); goto done; }
+                    if (step == 0) { refusal = (1, r.GetProperty("crossFrame").GetBoolean() ? "no sign-in form on this page itself. If the page shows one, it is inside an embedded frame from another site, which the vault never fills: run `handoff` now so the user signs in on their screen. Otherwise click the site's Sign in / Log in link first, then run `login`." : "no sign-in form on this page. Click the site's Sign in / Log in link first, then run `login`."); goto done; }
                     break;
                 }
                 // H2: never let the password be submitted to another host, and never via an explicit GET (which would put it in the URL).
@@ -835,18 +1041,20 @@ done:;
 
     // ---- 7-day sessions: wipe the cookies and storage of expired vault sites and of any site whose cookies were first seen 7+ days ago
 
-    async Task Sweep(bool startup)
+    // Returns true when it wiped (every tab was reset to a blank page).
+    async Task<bool> Sweep(bool startup)
     {
         lastSweep = DateTime.UtcNow;
         try
         {
             Vault.Sweep();
             var t = tabs.FirstOrDefault();
-            if (t == null) return;
+            if (t == null) return false;
             var cookies = await t.W.CookieManager.GetCookiesAsync(null);
-            foreach (var site in cookies.Select(c => Vault.Site(c.Domain.TrimStart('.'))).Where(s => s.Length > 0).Distinct()) if (!Vault.Known(site)) Vault.NoteSite(site);
+            var cookieSites = cookies.Select(c => Vault.Site(c.Domain.TrimStart('.'))).Where(s => s.Length > 0).Distinct().ToList();
+            foreach (var site in cookieSites) if (!Vault.Known(site)) Vault.NoteSite(site);
             var due = Vault.DueClears();
-            if (due.Count == 0) return;
+            if (due.Count == 0) return false;
             // M4: once ANYTHING is due to expire, wipe the WHOLE profile — every cookie and all storage for every origin we can name.
             // Partitioned/SSO cookies and storage a per-site wipe would miss (e.g. accounts.google.com backing a site you signed into)
             // die too. This is the simplest option that guarantees the expired session cannot survive anywhere in the profile.
@@ -858,10 +1066,20 @@ done:;
                 .Where(o => o.Length > 8).Distinct().ToList();
             foreach (var o in origins) try { await Cdp(t, "Storage.clearDataForOrigin", new { origin = o, storageTypes = "all" }); } catch { }
             try { await Cdp(t, "Network.clearBrowserCache", new { }); } catch { }
-            foreach (var (site, _) in due) Vault.Cleared(site);
-            Log($"web host: wiped the profile ({n} cookies, {origins.Count} origins) because {due.Count} session(s) expired");
+            // And the profile-wide clear, which also reaches origins nobody could name (storage of sites that never set a cookie).
+            bool all = false;
+            try { await t.W.Profile.ClearBrowsingDataAsync(); all = true; } catch (Exception ex) { Log("web host: full profile clear failed: " + ex.Message); }
+            // Open pages could hold a session in memory and write it straight back after the wipe: every tab starts over blank.
+            foreach (var x in tabs) try { x.LastError = null; x.W.Navigate("about:blank"); } catch { }
+            // Every cookie is gone, so each cookie site's 7-day clock restarts with its next cookie; before, the other sites kept their old
+            // first-seen times and each one crossing 7 days wiped the whole profile again, signing the user out of everything every few days.
+            // Only after the profile-wide clear succeeded: otherwise storage it couldn't name may still hold an older session.
+            foreach (var site in due.Select(d => d.Site).Concat(all ? cookieSites : Enumerable.Empty<string>()).Distinct()) Vault.Cleared(site);
+            notes.Add("the browser's saved sessions reached the 7-day limit and were wiped: every site is signed out and the tabs were reset");
+            Log($"web host: wiped the profile ({n} cookies, {origins.Count} origins{(all ? ", full clear" : "")}) because {due.Count} session(s) expired");
+            return true;
         }
-        catch (Exception ex) { Log("web host: sweep failed: " + ex.Message); }
+        catch (Exception ex) { Log("web host: sweep failed: " + ex.Message); return false; }
     }
 
     // ---- H1: in-process forward proxy on loopback. Chromium (started with --proxy-server pointing here) sends every connection here;
@@ -915,8 +1133,8 @@ done:;
                     else if (Uri.TryCreate(target, UriKind.Absolute, out var au)) { host = au.Host; port = au.Port > 0 ? au.Port : 80; }
                     else { await Deny(cs, 400, "Bad Request"); return; }
 
-                    var ip = Resolve(host);
-                    if (ip == null) { await Deny(cs, connect ? 403 : 403, "Forbidden"); Log($"web host: proxy refused {host} (private/unresolvable)"); return; }
+                    var ip = Resolve(host, out string why);
+                    if (ip == null) { await Deny(cs, 403, "Forbidden"); Note(host, why); return; }
 
                     using var up = new TcpClient();
                     await up.ConnectAsync(ip, port);
@@ -944,16 +1162,33 @@ done:;
             }
         }
 
-        // Validate the destination: refuse if the host, or ANY address it resolves to, is private (defeats rebinding). Return the IP to use.
-        static IPAddress Resolve(string host)
+        // Recent refusals by host, so a failed navigation can report the real reason (the browser itself only sees a 403 from the proxy).
+        readonly System.Collections.Concurrent.ConcurrentDictionary<string, (string Why, DateTime At, DateTime Logged)> refused = new(StringComparer.OrdinalIgnoreCase);
+
+        public string Why(string host) => host != null && refused.TryGetValue(host, out var r) && DateTime.UtcNow - r.At < TimeSpan.FromMinutes(2) ? r.Why : null;
+
+        void Note(string host, string why)
+        {
+            var now = DateTime.UtcNow;
+            bool log = !refused.TryGetValue(host, out var old) || old.Why != why || now - old.Logged > TimeSpan.FromMinutes(10);
+            if (refused.Count > 500) refused.Clear();
+            refused[host] = (why, now, log ? now : old.Logged);
+            if (log) Log($"web host: proxy refused {host}: {why}");   // once per host and reason (every 10 min), not once per request
+        }
+
+        // Validate the destination: refuse if the host, or ANY address it resolves to, is private (defeats rebinding). Return the IP to use;
+        // `why` says why not (blocked on this PC by a 0.0.0.0 entry, private, or not found).
+        static IPAddress Resolve(string host, out string why)
         {
             string h = (host ?? "").Trim('[', ']');
+            why = $"{h} is on this PC or the local network, which is off limits";
             if (PrivateHost(h)) return null;
             if (IPAddress.TryParse(h, out var lit)) return PrivateIp(lit) ? null : lit;
             if (TryNumericIPv4(h, out var num)) return PrivateIp(num) ? null : num;
             IPAddress[] addrs;
-            try { var t = Dns.GetHostAddressesAsync(h); if (!t.Wait(4000)) return null; addrs = t.Result; } catch { return null; }
-            if (addrs.Length == 0 || addrs.Any(PrivateIp)) return null;
+            try { var t = Dns.GetHostAddressesAsync(h); if (!t.Wait(4000)) { why = $"{h} didn't resolve in time"; return null; } addrs = t.Result; }
+            catch { why = $"{h} can't be found (the name doesn't resolve)"; return null; }
+            if ((why = RefuseReason(h, addrs)) != null) return null;   // same set as before: empty, or any private / 0.0.0.0 / :: address
             return addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) ?? addrs[0];
         }
 
