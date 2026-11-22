@@ -10,6 +10,7 @@ static class Overnight
 {
     public static string TryLocal(string l, Settings s) => null;     // "tonight, <job>", "what's queued", "cancel tonight's jobs", "quiz me on <topic>"
     public static void Queue(string request) { }
+    public static List<string> ReadyToday() => new();               // one line per result finished since yesterday evening (Coach's morning brief)
     public static void Tick(Settings s, DateTime now) { }
     public static void SelfChecks(Action<bool, string> check) { }
     public static int Test(string[] args) { Console.WriteLine("nighttest ok"); return 0; }

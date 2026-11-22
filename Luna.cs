@@ -262,6 +262,31 @@ static class Luna
         });
     }
 
+    // Overnight jobs (Overnight.cs): runs a request like a spoken one (tools, browser, retries) but returns the answer instead of
+    // showing or speaking it. Waits for a running job to end; null if one is still going after 10 minutes.
+    internal static async Task<string> RunQuiet(string request, Settings s)
+    {
+        for (int waited = 0; Interlocked.CompareExchange(ref running, 1, 0) != 0; waited++)
+        {
+            if (waited >= 600) return null;
+            await Task.Delay(1000);
+        }
+        try
+        {
+            runStart = Environment.TickCount64; lastWidgetTitle = null;
+            activeModel = null; activeModelName = "Luna"; activeThread = Threads.NewId(); activeForced = false;
+            int work = Cards.BeginWork(request);
+            progressWork = work;
+            string answer; bool failed = false;
+            try { answer = await Execute(request, s, skipLocal: true); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { answer = "Luna couldn't run that: " + ex.Message; failed = true; }
+            Log($"quiet run: {request} -> {(failed ? "failed" : (answer?.Length ?? 0) + " chars")}");
+            Cards.EndWork(work, failed ? "Couldn't finish that" : null, failed, failed ? answer : null);
+            return answer;
+        }
+        finally { Interlocked.Exchange(ref running, 0); }
+    }
+
     // Jarvis talks back: short answers (and the first sentence of long ones) are said out loud unless Settings.SpeakReplies is "off".
     static void SpeakShort(string answer, Settings s, bool failed)
     {

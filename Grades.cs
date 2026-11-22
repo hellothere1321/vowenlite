@@ -14,6 +14,9 @@ static class Grades
     // How much a task matters for the grade, 0..1 (its category's weight in its course; 0 = unknown). Used by Schedule to rank.
     public static double Weight(Item task) => 0;
 
+    // One markdown line per course with grades ("Art: 86.4% (B), needs 72% on what's left to keep a B"); null = no courses yet. Coach's Sunday review.
+    public static string Outlook() => null;
+
     public static void SelfChecks(Action<bool, string> check) { }
     public static int Test(string[] args) { Console.WriteLine("gradetest ok"); return 0; }
 }
