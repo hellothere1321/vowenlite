@@ -101,6 +101,7 @@ static class Summariser
 
         File.WriteAllText(Path.Combine(folder, "summary.md.tmp"), await Codex(codex, folder, s, Prompt(transcript), true));
         File.Move(Path.Combine(folder, "summary.md.tmp"), Path.Combine(folder, "summary.md"), true);
+        await Capture.FromLecture(folder, s);   // assignments said in class -> planner inbox (never throws)
     }
 
     // "Ask AI" in the meeting window: answers a question from transcript.md (+ summary.md) of one meeting.

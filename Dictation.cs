@@ -231,7 +231,7 @@ sealed class Dictation
                 // inline left the "Thinking" pill stuck on screen whenever Luna answered instantly).
                 Luna.Start(request, s, () => work.Add(() => { if (recordingId < 0) Overlay.Set(Overlay.State.Hidden); }), recLuna);
             }
-            else if (text.Length > 0) Voice.Type(text, s);
+            else if (text.Length > 0) { Voice.Type(text, s); Capture.OnDictated(text, s); }
         }
         finally
         {
