@@ -12,7 +12,7 @@ static class WebOpts
     public static Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions Tiny() => new("--disable-gpu --in-process-gpu --disable-extensions --disable-background-networking --disable-sync --disable-component-update --disable-default-apps");
 }
 // The answer box (`VowenLite.exe --answer <file>`; the file is the request, a blank line, then the markdown reply).
-// It appears at the bottom right of the MAIN monitor (left of the card stack) once the answer is complete, without taking focus, so it can
+// It appears at the bottom right of the monitor being worked on (left of the card stack on the main one) once the answer is complete, without taking focus, so it can
 // be read while working: formatted text, tables, code and diagrams (Md.cs). It stays until closed (× / Esc when clicked into); a newer
 // answer replaces it. Expand makes it tall; the header drags it. Its own process so the daemon never loads WinForms.
 sealed class AnswerForm : Form
@@ -23,11 +23,12 @@ sealed class AnswerForm : Form
     readonly WebView2 web = new() { Dock = DockStyle.Fill, DefaultBackgroundColor = Theme.S1 };
     EventWaitHandle closeOthers;
     Rectangle work;
+    bool onPrimary = true;
     bool expanded;
     int contentHeight;
 
     protected override bool ShowWithoutActivation => true;
-    protected override CreateParams CreateParams { get { var cp = base.CreateParams; cp.ExStyle |= 0x00000080 /* TOOLWINDOW: no Alt+Tab entry */ | 0x08000000 /* NOACTIVATE: never steals focus until the reply row is clicked */; return cp; } }
+    protected override CreateParams CreateParams { get { var cp = base.CreateParams; cp.ExStyle |= 0x00000008 /* TOPMOST: Form.TopMost alone didn't stick with NOACTIVATE, the box ended up behind maximized windows */ | 0x00000080 /* TOOLWINDOW: no Alt+Tab entry */ | 0x08000000 /* NOACTIVATE: never steals focus until the reply row is clicked */; return cp; } }
 
     int S(int v) => (int)Math.Round(v * DeviceDpi / 96.0);
 
@@ -71,17 +72,46 @@ sealed class AnswerForm : Form
         TopMost = true;
         ShowInTaskbar = false;
         KeyPreview = true;
-        work = Screen.PrimaryScreen.WorkingArea;                      // always the main monitor
+        var scr = Screen.FromPoint(Cursor.Position);                  // the monitor being worked on: the active window's, else the cursor's
+        try { var fg = GetForegroundWindow(); if (fg != IntPtr.Zero) scr = Screen.FromHandle(fg); } catch { }
+        onPrimary = scr.Primary;
+        work = scr.WorkingArea;
         Size = new Size(S(480), S(autoClose ? 120 : 190));
         Place();
+        Dlog($"shown on {scr.DeviceName} (primary={onPrimary}) work={work} at {Location}");
+        // A monitor unplugged or rearranged while the box is open must not strand it off-screen.
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplayChanged;
+        // Re-assert topmost (cheap, no activation) so another window going topmost/maximized can't bury the box.
+        var keep = new System.Windows.Forms.Timer { Interval = 1500 };
+        // Only when the flag was actually lost, and never while the user is typing a reply (touching the window then made the reply row flicker).
+        keep.Tick += (_, _) => { if (IsHandleCreated && Visible && !ContainsFocus && (GetWindowLong(Handle, -20) & 0x8) == 0) SetWindowPos(Handle, (IntPtr)(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 /* NOSIZE|NOMOVE|NOACTIVATE */); };
+        keep.Start();
+        FormClosed += (_, e) => { Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplayChanged; Dlog("closed: " + e.CloseReason); };
         Controls.Add(web);
         Load += async (_, _) => await Start();
+    }
+
+    static void Dlog(string m) { try { File.AppendAllText(Path.Combine(Paths.DataDir, "daemon.log"), DateTime.Now.ToString("s") + " answer: " + m + Environment.NewLine); } catch { } }
+
+    void OnDisplayChanged(object s, EventArgs e)
+    {
+        try
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke(() =>
+            {
+                var scr = Screen.AllScreens.FirstOrDefault(x => x.WorkingArea.IntersectsWith(Bounds)) ?? Screen.PrimaryScreen;
+                onPrimary = scr.Primary; work = scr.WorkingArea;
+                Place(); Dlog($"display changed: moved to {scr.DeviceName} work={work}");
+            });
+        }
+        catch { }
     }
 
     // Bottom right, leaving the card column (timers, working cards) free at the very edge.
     void Place()
     {
-        int cards = S(288);
+        int cards = onPrimary ? S(288) : S(10);   // the card stack lives on the primary monitor only
         Location = new Point(work.Right - cards - Width, work.Bottom - Height - S(10));
     }
 
@@ -150,7 +180,7 @@ sealed class AnswerForm : Form
         else if (msg == "copy") { try { Clipboard.SetText(answer); } catch { } }
         else if (msg == "drag") { ReleaseCapture(); SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero); }
         else if (msg == "expand") { expanded = !expanded; Fit(); }
-        else if (msg == "focus") { try { SetWindowLong(Handle, -20, GetWindowLong(Handle, -20) & ~0x08000000); Activate(); web.Focus(); } catch { } }   // clicked into the reply row: only now may the box take keyboard focus
+        else if (msg == "focus") { if ((GetWindowLong(Handle, -20) & 0x08000000) == 0) return; try { SetWindowLong(Handle, -20, GetWindowLong(Handle, -20) & ~0x08000000); Activate(); web.Focus(); } catch { } }   // clicked into the reply row: only now may the box take keyboard focus
         else if (msg.StartsWith("reply:")) SendReply(msg.Substring(6));
         else if (msg.StartsWith("h:") && int.TryParse(msg.Substring(2), out int h)) { contentHeight = h; Fit(); }
     }
@@ -264,6 +294,8 @@ document.addEventListener('keydown', ev => { if (ev.key === 'Escape') post('clos
 
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     [DllImport("user32.dll")] static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
     [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);

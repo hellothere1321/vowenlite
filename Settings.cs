@@ -168,7 +168,7 @@ class Settings
     public bool Humanize { get; set; } = true;               // writing for you follows the natural-style rules, and typed text gets the free tidy-up pass
     public bool ArtCraft { get; set; } = true;               // Luna can drive EffectCraft / PhotoCraft / VectorCraft / FigCraft / PdfCraft through their command-lines
     public string ArtCraftDir { get; set; } = "";            // "" = %LOCALAPPDATA%\Programs\ArtCraft
-    public string SpeakReplies { get; set; } = "short";      // off | short (answers up to ~2 sentences are also said out loud) | all. "be quiet" / "talk to me" by voice
+    public string SpeakReplies { get; set; } = "off";        // off | short (answers up to ~2 sentences are also said out loud) | all. "be quiet" / "talk to me" by voice
     public string AssistantNames { get; set; } = "Luna, Jarvis";   // words that start a request with Right Shift ("Jarvis, what's on today")
     public int SettingsVersion { get; set; }              // bumps when a default is changed on purpose (see Load)
     public bool AutoSummarise { get; set; } = true;          // summarise with Codex right after transcribing

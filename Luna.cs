@@ -187,12 +187,13 @@ static class Luna
             {
                 DoneOnce();
                 if (string.IsNullOrWhiteSpace(local)) return;
-                if (local.StartsWith("✓")) Overlay.Notice(local); else Show(request, local);
+                Show(request, local);   // "✓ ..." opens the short auto-closing answer window
                 return;
             }
 
             // 2) A single leftover word is nearly always a mis-hearing ("stocktimer"): don't spend a Codex run on it.
-            if (!IsWidgetRequest(request) && Regex.Split(request.Trim(), @"\s+").Length <= 1)
+            // Not for replies in a conversation ("yes", "my.ccc.edu") or anything that looks like an address: those are real answers.
+            if (!forced && !IsWidgetRequest(request) && Regex.Split(request.Trim(), @"\s+").Length <= 1 && !Regex.IsMatch(request, @"[./:@\\\d]"))
             {
                 DoneOnce();
                 Overlay.Notice("Didn't catch “" + request.Trim().TrimEnd('.', ',', '?', '!') + "”", 3000, error: true);
@@ -256,7 +257,7 @@ static class Luna
             if (string.IsNullOrWhiteSpace(answer)) return;
             SpeakShort(answer, s, failed);
             // "✓ ..." = a short confirmation: shown in the pill (instant, nothing launched). Anything longer opens the answer window.
-            if (confirm) Overlay.Notice(answer);
+            if (confirm) Show(request, answer);
             else Show(request, answer, Threads.Get(tid) != null ? tid : null);
         });
     }
@@ -861,7 +862,7 @@ static class Luna
         "For a plain fact or short explanation, do NOT use a widget: reply in plain text.\n";
 
     static readonly Regex WidgetAskRx = new(
-        @"\b(?:make|build|create|generate|design|code|give|show|draw|plot|visuali[sz]e|simulate|set up|whip up)\b.*\b(?:widget|interactive|dashboard|simulat\w+|visuali[sz]\w+|chart|graph|plot|calculator|quiz|flashcards?|game|tracker|planner|mini ?app|app|tool|converter|generator|picker|timeline|diagram|slider|animation)\b|^(?:plot|graph|chart|visuali[sz]e|simulate|animate)\b|\b(?:interactive|widget)\b",
+        @"\b(?:make|build|create|generate|design|code|give|show|draw|plot|visuali[sz]e|simulate|set up|whip up)\b(?!\s+(?:it|that|this|sure|them|so)\b)(?:\W+\w+){0,5}?\W+(?:widget|interactive|dashboard|simulat\w+|visuali[sz]\w+|chart|graph|plot|calculator|quiz|flashcards?|game|tracker|planner|mini ?app|app|tool|converter|generator|picker|timeline|diagram|slider|animation)\b|^(?:plot|graph|chart|visuali[sz]e|simulate|animate)\b|\b(?:interactive|widget)\b",
         RegexOptions.IgnoreCase);
     static bool WidgetAsk(string r) => WidgetAskRx.IsMatch(r);
     internal static bool IsWidgetRequest(string r) => WidgetAsk(r);
@@ -905,7 +906,7 @@ static class Luna
     static readonly Regex AboutThisPc = new(@"\b(my (?:pc|computer|laptop|files?|folders?|desktop|downloads|screen|battery|disk|drive)|on this (?:pc|computer|laptop)|installed|running (?:processes|apps|programs)|this (?:folder|file|directory|window)|task manager|my network)\b", RegexOptions.IgnoreCase);
     // Things that need hands (shell, files, git), not just knowledge: "Do a git merge", "Can you just fix the merge", "can you update my-app".
     // "do/can/could/would/will/should" used to mark these as questions, which ran them read-only with the shell off ("I can't run git from this voice session").
-    static readonly Regex DoSomething = new(@"\b(?:git|github|merge|rebase|commit|branch|checkout|push|pull|fetch|clone|repo|repository|version|release|deploy|build|compile|install|uninstall|update|upgrade|fix|debug|patch|set\s?up|configure|create|make|add|change|edit|modify|rename|move|copy|delete|remove|download|run|restart|apply|launch|open|send|sync|hook|script|spicetify|spotify|ritme|figure\s+(?:it|this|that)\s+out|sort\s+(?:it|this|that)\s+out|handle\s+(?:it|this|that))\b|\.(?:cs|js|py|ps1|json|md)\b", RegexOptions.IgnoreCase);
+    static readonly Regex DoSomething = new(@"\b(?:git|github|merge|rebase|commit|branch|checkout|push|pull|fetch|clone|repo|repository|version|release|deploy|build|compile|install|uninstall|update|upgrade|fix|debug|patch|set\s?up|configure|create|make|add|change|edit|modify|rename|move|copy|delete|remove|download|run|restart|apply|launch|open|send|sync|hook|script|spicetify|spotify|ritme|go|check|search|browse|find|look\s+up|fill|submit|grab|pull\s+up|log\s?in|sign\s+in|figure\s+(?:it|this|that)\s+out|sort\s+(?:it|this|that)\s+out|handle\s+(?:it|this|that))\b|\.(?:cs|js|py|ps1|json|md)\b", RegexOptions.IgnoreCase);
     static bool IsQuestion(string r)
     {
         r = r.Trim();
@@ -917,7 +918,11 @@ static class Luna
         bool auxiliary = Regex.IsMatch(r, @"^(?:do|does|did|can|could|would|will|should)\b", RegexOptions.IgnoreCase);
         if (Regex.IsMatch(r, @"^do\s+(?!you\b|i\b|we\b|they\b|people\b)", RegexOptions.IgnoreCase)) return false;   // "Do a git merge", "Do the thing": an instruction, not "do you..."
         if (auxiliary && DoSomething.IsMatch(r)) return false;
+        // "Can you / could you / would you <verb>..." is a request to act unless the verb is plainly informational: tools, not a read-only answer.
+        if (Regex.IsMatch(r, @"^(?:can|could|would|will)\s+you\s+(?:please\s+)?(?!(?:tell|explain|describe|define|summari[sz]e|compare|translate|calculate|solve|list|name|spell|recommend|suggest|teach|rewrite|rephrase|proofread|correct|write|give|say|remind|help me understand)\b)\w+", RegexOptions.IgnoreCase)) return false;
         var last = LastTurn();
+        // Right after a job that did things, a short non-"wh-" request continues that job.
+        if (last != null && last.Task && r.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length <= 25 && !Regex.IsMatch(r, @"^(?:what|who|when|where|why|how|which|is|are|was|were|explain|define|tell me)\b", RegexOptions.IgnoreCase)) return false;
         if (FollowUpStart.IsMatch(r) && last != null && last.Task) return false;
         return true;
     }
