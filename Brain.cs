@@ -5,8 +5,8 @@ namespace VowenLite;
 
 // Decides how much model a request deserves when the user did not name one, and keeps count of what was spent.
 // The ChatGPT plan is shared with the user's own Codex use, so the rule is: cheapest thing that will do the job well.
-//   quick fact / short question      -> Luna, low effort        (the cheapest run there is)
-//   ordinary task or longer question -> Luna, the configured effort
+//   question (fact, explanation, how-to, sum; up to 40 words) -> Luna, low effort   (the cheapest run there is)
+//   ordinary task or very long question -> Luna, the configured effort
 //   hard thinking, real writing, code in a project, driving the screen, ArtCraft work -> Terra (Settings.SmartModel), capped per day
 // Saying a model ("Sol, ...", "swap to Terra") always wins over this. `--routetest "<request>"` prints the decision.
 static class Brain
@@ -16,7 +16,7 @@ static class Brain
     static readonly Regex Hard = new(@"\b(think (?:hard|carefully|deeply|it through)|carefully|step by step|in depth|in detail|thorough(?:ly)?|deep dive|research|analy[sz]e|prove|derive|proof|optimi[sz]e|architecture|design (?:a|an|the) (?:system|schema|algorithm)|trade-?offs?|root cause|why (?:is|does|did) .* (?:fail|crash|break|slow))\b", RegexOptions.IgnoreCase);
     static readonly Regex Code = new(@"\b(refactor|implement|debug|fix (?:the|this|my|a) (?:bug|build|error|crash|test|code|function|merge)|write (?:a|the|some) (?:function|class|script|program|test|component|parser|regex)|add (?:a |the )?(?:feature|endpoint|test|command|option)|stack trace|exception|compile|unit tests?|pull request|code review|merge conflicts?)\b|\.(?:cs|js|ts|py|rs|cpp|java|sv|v)\b", RegexOptions.IgnoreCase);
     internal static readonly Regex Writing = new(@"\b(?:write|draft|compose|finish|complete|continue|extend|expand|rewrite|rephrase|polish|proofread|humani[sz]e|improve|shorten|lengthen)\b.{0,60}\b(?:essay|paragraphs?|doc(?:k|ument|s)?|report|assignment|paper|article|story|speech|cover letter|letter|email|message|reply|response|post|summary|conclusion|introduction|intro|thesis|abstract|caption|bio|section|answer)\b|\b(?:essay|report|paper|assignment)\b.{0,30}\b(?:for me|about|on)\b", RegexOptions.IgnoreCase);
-    static readonly Regex Trivial = new(@"^(?:what(?:'s| is| are| was)?|who(?:'s| is| was)?|when|where|how (?:many|much|old|long|far|tall|big|do you (?:say|spell))|define|spell|translate|convert|is|are|does|did|capital of|meaning of)\b", RegexOptions.IgnoreCase);
+    internal static bool IsCode(string r) => Code.IsMatch(r);
 
     public static Pick Route(string request, bool question, bool widget, bool control, bool craft, Settings s)
     {
@@ -36,7 +36,9 @@ static class Brain
             return new(luna, eff == "low" ? "medium" : eff, "Luna", why + (smart == null ? "" : ", but today's smart-model budget is used up"), false);
         }
         if (widget) return new(luna, eff, "Luna", "widget", false);
-        if (question && words <= 16 && Trivial.IsMatch(request.Trim())) return new(luna, "low", "Luna", "quick question", false);
+        // Anything on the question path (read-only, no shell) that isn't hard or real writing is knowledge: low effort answers in a few seconds.
+        // Medium used to apply to every "why..." / "how do I..." / "explain..." and made them as slow as a task.
+        if (question && words <= 40) return new(luna, "low", "Luna", "quick question", false);
         return new(luna, eff, "Luna", question ? "question" : "task", false);
     }
 

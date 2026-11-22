@@ -162,6 +162,15 @@ static class Luna
         string tid = thread == "new" ? Threads.NewId() : forced ? thread : (!string.IsNullOrEmpty(thread) ? thread : Threads.Newest(FollowWindow)?.Id ?? Threads.NewId());
         int doneFlag = 0;
         void DoneOnce() { if (Interlocked.Exchange(ref doneFlag, 1) == 0) done(); }
+        // "done" / "I'm signed in" while Luna's sign-in window is still up = clicking its "I'm signed in" button: the waiting run carries on.
+        if (WebBridge.HandoffPending && Volatile.Read(ref running) == 1 && Threads.IsContinue(request))
+        {
+            saidSignedIn = true;
+            Log("user said they are signed in: the waiting request continues");
+            DoneOnce();
+            Overlay.Notice("✓ Continuing…", 2500);
+            return;
+        }
         string sw0 = SwitchTarget(request);
         if (sw0 != null)
         {
@@ -179,15 +188,35 @@ static class Luna
         if (pickedModel != null) Log($"model: {pickedName} ({pickedModel})");
         Task.Run(async () =>
         {
+            // 0) "done" / "I'm signed in" / "go on" / "ok try now" resume the request that stopped to wait on the user (a sign-in, a failed run),
+            // with its original text in its own thread, instead of running as a request of its own.
+            string said = request;
+            string resumed = Threads.Resume(request, thread, out string resumeTid, pendingOnly: true);
+
             // 1) Local commands never wait on Codex (a slow Codex run used to block "stop timer" and everything after it).
-            string local = null;
-            try { local = await TryLocal(request, s); }
-            catch (Exception ex) { Log("router error: " + ex.Message); }
-            if (local != null)
+            if (resumed == null)
+            {
+                string local = null;
+                try { local = await TryLocal(request, s); }
+                catch (Exception ex) { Log("router error: " + ex.Message); }
+                if (local != null)
+                {
+                    DoneOnce();
+                    if (string.IsNullOrWhiteSpace(local)) return;
+                    Show(request, local);   // "✓ ..." opens the short auto-closing answer window
+                    return;
+                }
+                resumed = Threads.Resume(request, thread, out resumeTid);   // nothing waiting: the conversation's last request
+            }
+            if (resumed != null)
+            {
+                Log($"continuing \"{(resumed.Length > 140 ? resumed.Substring(0, 140) : resumed)}\" after \"{said}\"");
+                request = resumed; tid = resumeTid; forced = true;
+            }
+            else if (Threads.IsContinue(request))
             {
                 DoneOnce();
-                if (string.IsNullOrWhiteSpace(local)) return;
-                Show(request, local);   // "✓ ..." opens the short auto-closing answer window
+                Overlay.Notice("Nothing is waiting to continue. Say the whole request again.", 4000, error: true);
                 return;
             }
 
@@ -217,7 +246,8 @@ static class Luna
             lastWidgetTitle = null;
             activeModel = pickedModel; activeModelName = pickedName;
             activeThread = tid; activeForced = forced;
-            int work = Cards.BeginWork(pickedName != "Luna" ? pickedName + " · " + request : request);
+            continueNote = resumed != null ? ContinueNote(said) : "";
+            int work = Cards.BeginWork((resumed != null ? "Continuing · " : "") + (pickedName != "Luna" ? pickedName + " · " + request : request));
             progressWork = work;                                    // a card with elapsed time appears if this takes > 0.7 s (click it to cancel)
             // The "Thinking" pill gives instant feedback; after a moment the card takes over.
             using var early = new System.Threading.Timer(_ => DoneOnce(), null, 1300, Timeout.Infinite);
@@ -225,7 +255,7 @@ static class Luna
             try { answer = await Execute(request, s, skipLocal: true); }
             catch (OperationCanceledException) { cancelled = true; Log("cancelled"); }
             catch (Exception ex) { Log("failed: " + ex.Message); answer = "Luna couldn't run that: " + ex.Message; failed = true; }
-            finally { Interlocked.Exchange(ref running, 0); }
+            finally { continueNote = ""; Interlocked.Exchange(ref running, 0); }
             Log($"ran {sw.Elapsed.TotalSeconds:0.0}s, answer {answer?.Length ?? 0} chars");
             DoneOnce();
 
@@ -236,7 +266,9 @@ static class Luna
                 return;
             }
             if ((sw.Elapsed.TotalSeconds > 1.5 || forced) && answer != null && !answer.StartsWith("✓") && !failed) Remember(request, answer, lastRunWasTask, tid);
-            else if (failed && lastFailureNote != null) Remember(request, lastFailureNote, true, tid);   // so "continue" / "try again" resumes with what was already done
+            else if (failed) Remember(request, lastFailureNote ?? answer, true, tid);   // so "continue" / "try again" resumes with what was already done
+            // A run that stopped for the user (sign-in, a failure, "...then say done") is what the next "done" resumes; any other ending clears it.
+            Threads.SetPending(tid, failed || WaitsOnUser(answer) ? request : null);
             Projects.AfterExchange(request, failed ? null : answer, lastRunWasTask);
 
             bool confirm = answer != null && answer.StartsWith("✓");
@@ -312,7 +344,7 @@ static class Luna
         var s = Settings.Load();
         bool craft = Craft.Ask(request, s), widget = !craft && WidgetAsk(request);
         bool control = IsControl(request, s, widget);
-        bool web = !widget && WebBridge.Ask(request, s);
+        bool web = !widget && WebAsk(request, s);
         bool question = !control && !craft && !web && (widget || IsQuestion(request));
         var p = Brain.Route(request, question, widget, control, craft, s);
         return $"{(widget ? "widget" : control ? "screen control" : craft ? "ArtCraft" : question ? "question" : "task")}{(web ? " + web browser" : "")} -> {p.Name} ({p.Model}, {p.Effort} effort): {p.Why}" + (Brain.Writing.IsMatch(request) && s.Humanize ? " + writing style" : "");
@@ -583,7 +615,7 @@ static class Luna
             if (local != null) return local;
         }
         lock (runSteps) runSteps.Clear();
-        resumeNote = ""; lastFailureNote = null;
+        resumeNote = ""; lastFailureNote = null; lastRunWasWeb = false;
         try { return await RunCodex(request, s); }
         catch (Exception ex) when (ex is not OperationCanceledException && ex is not FileNotFoundException && !DryRun)
         {
@@ -610,21 +642,24 @@ static class Luna
     static async Task<string> RunCodex(string request, Settings s)
     {
         string handoffNote = "";
+        saidSignedIn = false;
         for (int handoffs = 0; ; handoffs++)
         {
             try
             {
                 string answer = await RunCodexInner(request, s, handoffNote);
                 if (!WebBridge.HandoffPending) return answer;
-                if (handoffs >= 3) return "The website kept asking for sign-in. I stopped after three attempts.";
+                if (handoffs >= 3) return "The site kept asking me to sign in, so I stopped after three tries. Say “try again” and sign in once more in the window that opens.";
                 PcBridge.End();
                 Cards.Progress(progressWork, "Waiting for you to sign in");
-                bool returned = await WebBridge.WaitForHandoff(() => cancelRequested);
+                // the window's "I'm signed in" button, or "done" / "I'm signed in" said or typed to Luna (see Start)
+                bool returned = await WebBridge.WaitForHandoff(() => cancelRequested || saidSignedIn);
                 if (cancelRequested) throw new OperationCanceledException();
-                if (!returned) return "The sign-in window closed or timed out before I could continue.";
+                if (!returned && !saidSignedIn) return "The sign-in window closed or timed out before you finished. Say “try again” and I'll open it again.";
+                saidSignedIn = false;   // WebBridge.End below takes the window off the screen when it was a spoken "done"
                 Overlay.Notice("Browser returned. Luna is continuing…", 3500);
                 Cards.Progress(progressWork, "Continuing after sign-in");
-                handoffNote = "SIGN-IN HANDOFF COMPLETE: The user pressed I'm signed in and returned the browser. Continue the original request now. "
+                handoffNote = "SIGN-IN HANDOFF COMPLETE: The user signed in and returned the browser. Continue the original request now. "
                     + "Start with `node vweb.js read` on the current browser tab. Preserve the session and verify the page before doing more. "
                     + "Only open another sign-in if the current page actually requires it. Do not ask the user to confirm again. "
                     + "Previous work (check the current state before repeating it): " + StepsDone() + "\n\n";
@@ -635,7 +670,7 @@ static class Luna
 
     static async Task<string> RunCodexInner(string request, Settings s, string handoffNote)
     {
-        string codex = Summariser.FindCodex(s) ?? throw new FileNotFoundException("Codex CLI not found. Is the Codex app installed?");
+        string codex = Summariser.FindCodex(s) ?? throw new FileNotFoundException("Codex CLI not found. Install the Codex app, then say “try again”.");
         string work = Directory.CreateDirectory(Path.Combine(Paths.DataDir, "luna")).FullName;
         string tmp = Path.Combine(work, "answer-" + Guid.NewGuid().ToString("N") + ".tmp");
 
@@ -655,9 +690,9 @@ static class Luna
         bool craft = Craft.Ask(request, s);                       // an ArtCraft job (video, image, vector, design, PDF) wins over "make a ... animation" = widget
         bool widget = !craft && WidgetAsk(request);
         bool control = IsControl(request, s, widget);             // needs to see and operate the screen (click, scroll, finish the doc that is open)
-        bool web = !widget && (handoffNote.Length > 0 || WebBridge.Ask(request, s));
+        bool web = !widget && (handoffNote.Length > 0 || (continueNote.Length > 0 && s.WebBrowser && LastTurn()?.Web == true) || WebAsk(request, s));
         bool question = !control && !craft && !web && (widget || IsQuestion(request));
-        lastRunWasTask = !question;
+        lastRunWasTask = !question; lastRunWasWeb = web;
         PcBridge.Begin(control, craft);                           // vpc.js works only for this run, and only for what was asked
         WebBridge.Begin(web);
         if (!question)
@@ -674,7 +709,8 @@ static class Luna
             ? "A screenshot of the window the user is in is attached. " + (File.Exists(shot + ".txt") ? PcBridge.NoteShot(shot + ".txt") + " " : "") + "\"this\", \"that\" and \"it\" refer to what is in it.\n\n"
             : ScreenNote;
         try { File.Delete(shot + ".txt"); } catch { }
-        extraBlock = handoffNote + (control ? PcBridge.Help : "") + (web ? WebBridge.Help : "") + (craft ? Craft.Help(s) : "") + (s.Humanize && Brain.Writing.IsMatch(request) ? Humanize.StyleBlock : "");
+        extraBlock = handoffNote + (handoffNote.Length == 0 ? continueNote : "") + (control ? PcBridge.Help : "") + (web ? WebBridge.Help : !s.WebBrowser && !question ? BrowserOff : "")
+            + (craft ? Craft.Help(s) : "") + (s.Humanize && Brain.Writing.IsMatch(request) ? Humanize.StyleBlock : "");
 
         // Which model: the one named out loud ("Sol, ...", "swap to Terra"), otherwise the cheapest that suits the request (Brain.cs).
         string model = activeModel, effort = s.LunaEffort;
@@ -752,8 +788,51 @@ static class Luna
         finally { try { File.Delete(tmp); } catch { } if (shot != null) try { File.Delete(shot); } catch { } }
     }
 
-    static volatile bool lastRunWasTask;
+    static volatile bool lastRunWasTask, lastRunWasWeb;
+    static volatile bool saidSignedIn;   // "done" said while the sign-in window was up (Start): the waiting run continues as if its button was clicked
+    static string continueNote = "";     // per run: a "done" / "go on" resumed this request (Start)
     static long runStart;
+
+    static string ContinueNote(string said) =>
+        "CONTINUING: the user just said \"" + Regex.Replace(said.Trim(), @"\s+", " ") + "\": they have done what this request was waiting for (usually signing in in your browser window) and want it finished now. "
+        + "Pick it up where it stopped: check the current state first (for a website, `node vweb.js read` the current tab; on a sign-in page run `login`, or `handoff` if that is refused), skip steps already done, and do not ask them to confirm again.\n\n";
+
+    const string BrowserOff = "Your background browser is switched off in settings. If the request needs a website that web search can't show you, say so in one sentence and end with: turn on WebBrowser in settings.json, then say \"try again\".\n\n";
+
+    // An answer that stops for the user ("sign in in the window, then say done", the sign-in messages in RunCodex): the next "done" resumes that request.
+    static readonly Regex WaitsRx = new(@"\b(?:say|type|tell me|let me know)\W+(?:\w+\W+){0,4}?(?:done|signed in|logged in|ready|continue|go on|try again)\b|\b(?:once|when|after) you(?:['’](?:ve|re)|\s+have|\s+are)?\s+(?:\w+\s+){0,3}?(?:signed|logged|done|finished|ready|added|approved|entered)\b|\b(?:sign|log)[- ]?in (?:window|page|screen)\b.{0,30}\b(?:open|closed|timed out)|\bkept asking me to sign in\b", RegexOptions.IgnoreCase);
+    internal static bool WaitsOnUser(string answer) => !string.IsNullOrWhiteSpace(answer) && WaitsRx.IsMatch(answer);
+
+    // The background browser is on for this request: a website named or implied (WebBridge.Ask, course-site words), or a short follow-up to an
+    // exchange that used it or talked about one ("yes" after "...open your readings in the browser?", "now do all the readings").
+    // A plain knowledge question never gets it, even right after a web job (that made every question a 30 s browser task).
+    static readonly Regex SchoolSite = new(@"\b(?:school|class|course|college|uni(?:versity)?|student) ?(?:site|website|portal|page|account|login)\b|\b(?:my|the|our) (?:readings?|grades?|gradebook|syllabus|course ?work|course pages?|discussion (?:board|posts?)|announcements|lecture slides)\b", RegexOptions.IgnoreCase);
+    static readonly Regex BrowserTalk = new(@"\b(?:browser|web ?sites?|web ?pages?|portal|sign(?:ed)? in|log(?:ged)? in)\b", RegexOptions.IgnoreCase);
+    static bool WebAsk(string r, Settings s)
+    {
+        if (!s.WebBrowser || Knowledge(r)) return false;
+        if (WebBridge.Ask(r, s) || SchoolSite.IsMatch(r)) return true;
+        return LastTurn() is Turn last && (last.Web || (last.Task && BrowserTalk.IsMatch(last.A))) && (activeForced || r.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length <= 25);
+    }
+
+    // Plain knowledge: a fact, an explanation, a how-to or a sum that needs no tools, no website and nothing from earlier in the conversation
+    // ("what is osmosis", "how do I convert C to F", "why is the sky blue", "15 x 23"). Runs read-only and light at low effort (~5 s, not 30).
+    static readonly Regex Filler = new(@"^\W*(?:(?:hey|hi|ok(?:ay)?|so|um+|uh+|well|alright|quick question|real quick|question|luna|jarvis)\b\W*)+", RegexOptions.IgnoreCase);
+    static readonly Regex KnowledgeStart = new(@"^(?:what|what's|whats|who|who's|whom|whose|when|where|why|how|which|is|are|was|were|does|did|explain|define|describe|tell me (?:about|what|why|how|who|when|where|which)|teach me|compare|translate|calculate|solve|convert|simplify|factori[sz]e|spell|meaning of|definition of|difference between)\b", RegexOptions.IgnoreCase);
+    // "15 x 23", "(3 + 4) * 2", "12 divided by 5" (not "555-1234" or a bare number: those are replies)
+    static readonly Regex Sum = new(@"^[\d\s.,()]*\d[\d\s.,()]*(?:(?:[+*/×÷^x]|\s-\s)[\d\s.,()]*\d[\d\s.,()]*)+(?:=\s*)?$|^[\d.,]+\s*(?:plus|minus|times|divided by|over|to the power of|squared|cubed|percent of)\b[\w\s.,]*$", RegexOptions.IgnoreCase);
+    // Leans on context or needs hands: pointing words, the user's own things, websites, the PC, the planner, conversational follow-ups.
+    static readonly Regex Leans = new(@"\b(?:it|its|it's|that|this|these|those|they|them|their|there|here|above|again|same|my|mine|our|ours|earlier|previous|(?:did|have|can|could|will|would) you|you (?:did|found|said|opened|wrote|got|saw|read|made|just))\b|^(?:what (?:happened|went wrong|about|now|else|next)|why not|how (?:about|come))\b|\b(?:site|website|web ?page|page|portal|browser|tabs?|log ?in|sign(?:ed)? ?in|account|dashboard|e-?mail|inbox|screen|window|file|folder|repo|build|commit|branch|pc|computer|laptop|installed|clipboard|selected|readings?|grades?|assignments?|due|calendar|schedule|tasks?|meeting|timer|reminder)\b|https?://|\b[\w-]+\.(?:com|org|net|io|ai|dev|app|edu|gov|co|uk)\b", RegexOptions.IgnoreCase);
+    internal static bool Knowledge(string r)
+    {
+        r = Filler.Replace(r.Trim(), "").Trim();
+        if (r.Length == 0 || r.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length > 30) return false;
+        if (Sum.IsMatch(r.TrimEnd('?', '.', '!', ' '))) return true;
+        return KnowledgeStart.IsMatch(r) && !Leans.IsMatch(r) && !Code(r);
+    }
+    static bool Code(string r) => Brain.IsCode(r);
+    // No "the/he/she": a knowledge question that can't be about what the last task found ("what's the due date" after reading a course page).
+    static bool Standalone(string r) => !Regex.IsMatch(Filler.Replace(r.Trim(), ""), @"\b(?:the|he|she|his|her|him)\b", RegexOptions.IgnoreCase);
     static string projectBlock = "";
     static bool screenAttached;
     static string screenNote = "", extraBlock = "";   // per run: what the attached screenshot is; screen-control / ArtCraft / writing-style instructions
@@ -935,9 +1014,16 @@ static class Luna
     static bool IsQuestion(string r)
     {
         r = r.Trim();
-        // A short reply typed under an answer keeps that exchange's mode: after a task it stays a task, after a question it stays a question unless it names an action.
+        bool know = Knowledge(r);
+        // A short reply typed under an answer keeps that exchange's mode: after a task it stays a task (unless it is a self-contained knowledge
+        // question), after a question it stays a question unless it names an action.
         if (activeForced && LastTurn() is Turn prior && r.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length <= 8)
-            return !prior.Task && !DoSomething.IsMatch(r) && !AboutThisPc.IsMatch(r);
+            return prior.Task ? know && Standalone(r) : know || (!DoSomething.IsMatch(r) && !AboutThisPc.IsMatch(r));
+        // Plain knowledge is answered read-only and fast, also right after a task, unless it may lean on what that task found.
+        if (know && (LastTurn() is not Turn { Task: true } || Standalone(r))) return true;
+        // "and in kilometres?" / "what about plants" right after a question is more of the same question, not a job.
+        if (LastTurn() is Turn { Task: false } && r.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length <= 12 && Regex.IsMatch(r, @"^(?:and|also|so|then|but|or|what about|how about)\b", RegexOptions.IgnoreCase)
+            && !DoSomething.IsMatch(r) && !AboutThisPc.IsMatch(r)) return true;
         if (!QuestionStart.IsMatch(r) || AboutThisPc.IsMatch(r)) return false;
         // "write/rewrite/summarise/translate..." are knowledge tasks even though they mention "version" or "update"; only the auxiliary starters can hide an action.
         bool auxiliary = Regex.IsMatch(r, @"^(?:do|does|did|can|could|would|will|should)\b", RegexOptions.IgnoreCase);
@@ -966,7 +1052,7 @@ static class Luna
     static void Remember(string q, string a, bool task = false, string tid = null)
     {
         if (string.IsNullOrWhiteSpace(a) || a.StartsWith("DRY RUN")) return;
-        Threads.Append(tid ?? activeThread, q, a, task);
+        Threads.Append(tid ?? activeThread, q, a, task, lastRunWasWeb);
     }
 
     // The thread's last exchange if it still counts as "just now" for this request.
@@ -1013,7 +1099,8 @@ static class Luna
             sb.Append("You are Luna, the user's personal assistant (think Jarvis: capable, direct, a little dry, never gushing). Answer the question from your own knowledge")
               .Append(" (use web search when it is about something current or you are not sure). Do not run commands, do not look at files, and never ")
               .Append("mention workspaces, folders or files: they are irrelevant. The question was dictated by voice, so expect small speech-to-text slips ")
-              .Append("(numbers and symbols especially: \"w 3 3\" could be \"3 + 3\") and answer what was most likely meant instead of saying you can't find something.\n\n")
+              .Append("(numbers and symbols especially: \"w 3 3\" could be \"3 + 3\") and answer what was most likely meant instead of saying you can't find something. ")
+              .Append("If it truly needs something you can't reach from here (a signed-in website, their files or screen), say so in one sentence and end with the one request they can say to have it done with tools (e.g. Say: \"check it on the website\"); never ask permission.\n\n")
               .Append(AnswerStyle)
               .Append(WidgetRules).Append(Assistant.HookHelpFor(request)).Append(Planner.PromptBlock(request)).Append(Assistant.MemoryBlock()).Append(screenNote).Append(extraBlock).Append(projectBlock).Append(resumeNote).Append("Time now: ").Append(DateTime.Now.ToString("dddd d MMMM yyyy, HH:mm")).Append('\n');
             sb.Append(History());
@@ -1037,7 +1124,9 @@ static class Luna
           .Append("Be careful: never delete, overwrite or move the user's files, ")
           .Append("install software, change system settings, or send/post anything unless the request explicitly asks for it. ")
           .Append("For questions, answer directly in a few short sentences (markdown is fine). If you only carried out an action and there is ")
-          .Append("nothing worth telling the user, reply with nothing at all (an empty reply). If you couldn't do it, say why in one sentence.\n\n")
+          .Append("nothing worth telling the user, reply with nothing at all (an empty reply). If you couldn't do it, say why in one sentence, then end with exactly one concrete next step for the user: the words to say or the button to click, never a list of options.\n\n")
+          .Append("PERMISSION: the request is the user's permission. Everything this prompt gives you (the shell, your background browser when its WEB BROWSER section is here, screen control when its section is here) is already yours to use for it, so never ask \"may I...\", \"should I...\" or \"do you want me to...\" before using it: use it (the rules on paying, sending, deleting and final submits still stand). ")
+          .Append("When you must stop for the user (a sign-in, a code, a login to add to the vault), end with that one step and \"then say done\": saying done resumes this exact request.\n\n")
           .Append("WORK, DON'T TALK: you are an agent with a shell, not a chat bot. Never reply with a promise or a restatement of the request (\"I'll figure out the merge\", \"I'll look into it\") and never say you can't do something you haven't tried: run the commands in this same turn, look at the output, fix what went wrong, and only then reply with what you actually did and found (commit hashes, versions, file names, errors), then the one thing left for the user if any. Work through multi-step jobs yourself, step by step, checking each result before the next. When you cite a commit hash, name the repo and say whether it is pushed to origin or only exists locally (check with `git branch -r --contains <hash>`), because the user will look for it on GitHub and rewritten history can leave local-only hashes. You have up to 30 minutes, so long jobs are fine, but do not over-verify: one check that the result is right is enough, and never re-run a slow command just to look at its output again. A command that may take over a minute (installs, builds, network git, big searches) should be run in smaller pieces or in the background and checked on. Take the obvious reading of a vague request (\"figure it out\" = inspect the repo or situation first, decide, then act). Ask a question back only when two readings would do different damage. ")
           .Append("Git: in the user's own repos (the folders under Le code, which you may write to) local git works for you: status, diff, log, branch, checkout, merge, commit, tag, stash, and editing files to resolve conflicts or bump a version number (package.json, manifest, a VERSION constant, a changelog). Use `git -C <repo>` and, if git complains about dubious ownership, `-c safe.directory=*`. Only the network steps go through `node vgit.js` (fetch, pull, push, ls-remote): a merge conflict from a pull is yours to resolve in the files, then `git add` and `git commit` locally. Push works only when the user's request says push (the bridge refuses otherwise, and never force-pushes or deletes); when the last step would be a push they didn't ask for, do everything before it and say it is ready to push. Never rewrite history or delete branches unless the request says so.\n\n")
           .Append(resumeNote).Append("Time now: ").Append(DateTime.Now.ToString("dddd d MMMM yyyy, HH:mm")).Append(History()).Append("\n\nRequest: ").Append(request).Append('\n');
