@@ -33,19 +33,8 @@ static class Focus
             loaded = true;
             try { if (File.Exists(FilePath)) cur = JsonSerializer.Deserialize<State>(File.ReadAllText(FilePath)); } catch { cur = null; }
         }
-        if (cur != null && (now >= cur.EndsAt || TimerGone())) { cur = null; timerSeen = false; Save(); }   // the block is over, or "stop focus" / "cancel the timers" ended it
+        if (cur != null && now >= cur.EndsAt) { cur = null; Save(); }   // the block is over
         return cur;
-    }
-
-    // The existing "stop focus" / "cancel timers" commands only cancel the focus timer. Once it was seen running in this process and
-    // is gone, the focus is over (after a restart, before the timer is seen, only EndsAt counts).
-    static bool timerSeen;
-    static bool TimerGone()
-    {
-        bool running;
-        try { running = Commands.Running().Any(t => t.Id == "focus"); } catch { return false; }
-        if (running) timerSeen = true;
-        return timerSeen && !running;
     }
 
     static void Save()
@@ -140,8 +129,7 @@ static class Focus
             var t = FuzzyTask(m.Groups[1].Value, Planner.OpenTasks());
             return t == null ? null : Start(t, s);
         }
-        // "with it/this/that" is required: a bare "done" / "I'm done" resumes Luna's waiting request (Threads.IsContinue), even mid-focus.
-        if (Regex.IsMatch(l, @"^(?:(?:i'?m|i am) )?(?:done|finished) with (?:it|this|that)$", RegexOptions.IgnoreCase))
+        if (Regex.IsMatch(l, @"^(?:(?:i'?m|i am) )?(?:done|finished)(?: with (?:it|this|that))?$", RegexOptions.IgnoreCase))
         {
             string id = ActiveTaskId;
             var t = id == null ? null : Planner.OpenTasks().FirstOrDefault(x => x.Id == id);

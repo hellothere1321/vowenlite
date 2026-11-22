@@ -41,12 +41,6 @@ Say **"planner"** (hold Right Shift, no Luna needed), or say "open planner" to L
 - Sync runs every 5 minutes in the background, 2 s after any change made on the PC, every minute while the Plan window is open.
 - The PC rings a card before an event (default 10 min; "remind me" reminders ring at the time, repeating ones every time). The phone notifies through the Calendar app's own alerts.
 
-## Assistant extras (see COMMANDS.md)
-- Calendar feeds become tasks: date only, the due time is kept at the start of the notes.
-- Work blocks are ordinary events on your phone's calendar titled "Work: ..."; VowenLite moves only those.
-- The planner inbox holds suggestions until accepted; accepted ones sync like any task.
-- Estimates, time spent, links and sources stay on the PC; Google never sees them.
-
 ## Limits
 - Google Tasks only stores a due **date** (no time). A task you give a time keeps it in the title ("Call mom (5:00 PM)"). Use "remind me ..." / an event when you need a timed alert on both devices. Priority and notes of tasks stay on the PC (Tasks has no field for priority); events keep list + priority in hidden Google fields.
 - Only the primary calendar and events from yesterday to 90 days ahead are synced. Repeating events made on the phone appear as individual occurrences (read as separate events); repeating events made on the PC are real recurring events on both sides. Unusual rules ("2nd Tuesday") can't be created here. A single occurrence moved (not deleted) on the phone stays at its old time here.

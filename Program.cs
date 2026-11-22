@@ -79,7 +79,7 @@ static class Program
         }
         if (args.Length == 1 && args[0] == "--webhost") return WebHost.Run();
         if (args.Length >= 1 && args[0] == "--vault") { ApplicationConfiguration.Initialize(); Application.Run(new VaultForm(args.Length > 1 ? args[1] : null)); return 0; }
-        // `--webtest open example.com` / `--webtest read`: one background-browser command (the host stays up for the next one: 3 min in tests, 2 h otherwise). No Jobs.Init on purpose.
+        // `--webtest open example.com` / `--webtest read`: one background-browser command (the host stays up 3 min for the next one). No Jobs.Init on purpose.
         if (args.Length >= 2 && args[0] == "--webtest") { Console.WriteLine(WebBridge.Test(args.Skip(1).ToList())); return 0; }
         if (args.Length >= 1 && args[0] == "--vaulttest") return args.Length > 1 && args[1] == "live" ? WebTest.Live() : Vault.SelfTest();
         if (args.Length == 2 && args[0] == "--projtest") { Jobs.Init(); var ctx = Projects.Context(args[1], Settings.Load()); Console.WriteLine(ctx); Console.WriteLine($"({ctx.Length} chars, ~{ctx.Length / 4} tokens)"); return 0; }
