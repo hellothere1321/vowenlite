@@ -10,6 +10,7 @@ sealed class VaultForm : Form
     readonly Label title = new() { Text = "Passwords", ForeColor = Theme.Ink, AutoSize = true, BackColor = Color.Transparent },
         sub = new() { Text = "Luna signs in with these in its own background browser. It never sees a password; each one lasts 7 days.", ForeColor = Theme.Soft, AutoSize = false, BackColor = Color.Transparent },
         status = new() { ForeColor = Theme.Soft, AutoSize = false, BackColor = Color.Transparent };
+    readonly CheckBox subs = new() { Text = "Also fill on this site's other pages, like a school's logon. or sso. sign-in", ForeColor = Theme.Soft, BackColor = Color.Transparent, AutoSize = false, Checked = true, FlatStyle = FlatStyle.Flat };
     readonly Panel[] frames = new Panel[3];
     readonly Label[] caps = new Label[3];
     bool armed;
@@ -43,14 +44,15 @@ sealed class VaultForm : Form
             fr.Click += (_, _) => boxes[fr == frames[0] ? 0 : fr == frames[1] ? 1 : 2].Focus();
             Controls.Add(caps[i]); Controls.Add(fr);
         }
-        Controls.AddRange(new Control[] { title, sub, list, save, remove, status });
+        subs.Font = Theme.Font(Theme.Body, 9f);
+        Controls.AddRange(new Control[] { title, sub, list, subs, save, remove, status });
         pass.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Save(); } };
         save.Click += (_, _) => Save();
         remove.Click += (_, _) => Remove();
         list.SelectedIndexChanged += (_, _) =>
         {
             armed = false; remove.Text = "Remove";
-            if (list.SelectedRow?.Tag is Vault.Entry e) { site.Text = e.Site; user.Text = e.User; pass.Text = ""; status.Text = e.Expired ? "Expired: type the password again to revive it." : "To change it, type a new password and Save."; }
+            if (list.SelectedRow?.Tag is Vault.Entry e) { site.Text = e.Site; user.Text = e.User; pass.Text = ""; subs.Checked = Vault.Wide(e); status.Text = e.Expired ? "Expired: type the password again to revive it." : "To change it, type a new password and Save."; }
         };
         Layout += (_, _) => Arrange();
         Refill();
@@ -65,7 +67,7 @@ sealed class VaultForm : Form
         int m = S(24), w = ClientSize.Width - m * 2, y = S(18);
         title.Location = new Point(m - S(2), y); y += title.Height + S(4);
         sub.Bounds = new Rectangle(m, y, w, S(40)); y += S(44);
-        int formH = 3 * S(62) + S(100);
+        int formH = 3 * S(62) + S(100) + S(30);
         list.Bounds = new Rectangle(m - S(8), y, w + S(16), Math.Max(S(80), ClientSize.Height - y - formH));
         y = list.Bottom + S(14);
         for (int i = 0; i < 3; i++)
@@ -76,6 +78,7 @@ sealed class VaultForm : Form
             b.Bounds = new Rectangle(S(12), (frames[i].Height - b.PreferredHeight) / 2, w - S(24), b.PreferredHeight);
             y += S(34) + S(10);
         }
+        subs.Bounds = new Rectangle(m, y, w, S(24)); y += S(30);
         save.Location = new Point(m, y + S(4));
         remove.Location = new Point(save.Right + S(8), y + S(4));
         status.Bounds = new Rectangle(remove.Right + S(12), y + S(4), Math.Max(S(40), ClientSize.Width - remove.Right - S(12) - m), S(36));
@@ -99,7 +102,7 @@ sealed class VaultForm : Form
 
     void Save()
     {
-        string err = Vault.Save(site.Text, user.Text.Trim(), pass.Text);
+        string err = Vault.Save(site.Text, user.Text.Trim(), pass.Text, subs.Checked);
         pass.Text = "";
         if (err.Length > 0) { status.ForeColor = Theme.Err; status.Text = err; return; }
         status.ForeColor = Theme.Soft; status.Text = "Saved for 7 days.";

@@ -703,11 +703,12 @@ static class Luna
         }
         projectBlock = widget ? "" : Projects.Context(request, s);   // only when a project is named, or was the last topic (see Projects.cs)
         string shot = null;
-        if (handoffNote.Length == 0 && !widget && (control || ScreenAsk.IsMatch(request))) shot = TakeShot(work, control);
+        circled = false;
+        if (handoffNote.Length == 0 && !widget && (control || ScreenAsk.IsMatch(request) || CircleAsk.IsMatch(request))) shot = TakeShot(work, control, !control && CircleAsk.IsMatch(request));
         screenAttached = shot != null;
         screenNote = !screenAttached ? "" : control
             ? "A screenshot of the window the user is in is attached. " + (File.Exists(shot + ".txt") ? PcBridge.NoteShot(shot + ".txt") + " " : "") + "\"this\", \"that\" and \"it\" refer to what is in it.\n\n"
-            : ScreenNote;
+            : (circled ? CircleNote : "") + ScreenNote;
         try { File.Delete(shot + ".txt"); } catch { }
         extraBlock = handoffNote + (handoffNote.Length == 0 ? continueNote : "") + (control ? PcBridge.Help : "") + (web ? WebBridge.Help : !s.WebBrowser && !question ? BrowserOff : "")
             + (craft ? Craft.Help(s) : "") + (s.Humanize && Brain.Writing.IsMatch(request) ? Humanize.StyleBlock : "");
@@ -840,14 +841,20 @@ static class Luna
     // "what's this error on my screen", "what am I looking at", "read my screen": attach a picture of the active window.
     static readonly Regex ScreenAsk = new(@"\b(?:on|in|from)\s+(?:my\s+|the\s+)?screen\b|\b(?:this|that|the|my)\s+(?:doc(?:k|s)?|documents?|box|field|form|section|paragraph|essay|assignment|worksheet|slide|sheet)\b|\b(?:complete|finish|fill(?:\s+(?:in|out))?|continue|answer)\s+(?:this|that|it|the|my)\b|\b(?:my|the)\s+screen\b|\bwhat(?:'s| is| am i)\s+(?:am i\s+)?(?:looking at|seeing)\b|\blook\s+at\s+(?:this|my|the)\b|\bthis\s+(?:error|page|window|code|problem|question|screen)\b|\b(?:read|explain|summari[sz]e)\s+(?:this|that|it)\b", RegexOptions.IgnoreCase);
 
-    internal static string TakeShot(string dir, bool forControl = false)
+    // "let me circle what I mean", "I'll circle it": the user draws on a frozen picture of the window first (Shot.cs, Circler).
+    static readonly Regex CircleAsk = new(@"\b(?:let me|lemme|let us|let's|can i|could i|i(?:'ll| will| want to| wanna| can| need to))\s+(?:to\s+)?(?:circle|highlight|draw|mark|annotate|point)\b|\bcircle\s+(?:it|this|that|something|stuff|mode|what)\b|\b(?:circle|annotate|mark\s+up)\s+(?:on|in|from)\s+(?:my|the)\s+screen\b|\bwhat(?:'s| is| i)\s+(?:i\s+)?circled\b", RegexOptions.IgnoreCase);
+    static bool circled;   // per run: the attached picture has the user's red circles on it
+
+    internal static string TakeShot(string dir, bool forControl = false, bool circle = false)
     {
         try
         {
             string path = Path.Combine(dir, "screen-" + Guid.NewGuid().ToString("N") + ".png");
             // for screen control the picture also records where it sits on the screen, so click coordinates can be mapped back
-            using var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath, "--shot \"" + path + "\"" + (forControl ? " --meta --max 1400" : "")) { UseShellExecute = false, CreateNoWindow = true });
-            if (p == null || !p.WaitForExit(6000)) { try { p?.Kill(); } catch { } return null; }
+            using var p = Process.Start(new ProcessStartInfo(Environment.ProcessPath, "--shot \"" + path + "\"" + (forControl ? " --meta --max 1400" : "") + (circle ? " --circle" : "")) { UseShellExecute = false, CreateNoWindow = true });
+            if (p == null || !p.WaitForExit(circle ? 100000 : 6000)) { try { p?.Kill(); } catch { } return null; }
+            if (circle && !File.Exists(path)) return TakeShot(dir, forControl);   // skipped with Esc: plain picture
+            circled = circle;
             return File.Exists(path) ? path : null;
         }
         catch (Exception ex) { Log("screenshot failed: " + ex.Message); return null; }
@@ -1080,6 +1087,7 @@ static class Luna
         "font-family Segoe UI, font-size 13-15, nothing overlapping, every element labelled; no scripts, images or external references. Do not describe the diagram in words as well. " +
         "No preamble, no restating the question, no closing offer of more help.\n\n";
 
+    const string CircleNote = "The user drew RED circles/marks on the attached screenshot to show exactly what they mean: focus your answer on what is inside or under the red marks (ignore the rest unless needed for context). If they gave no other question, explain what is marked. Do not mention the red marks as part of the app.\n";
     const string ScreenNote ="A screenshot of the window the user is looking at is attached; \"this\", \"that\" and \"it\" probably refer to what is in it. Use it only if the request needs it. If they want something completed, written or answered in what is on screen (a document, form or box), read it from the screenshot and put the text in a TYPE: hook so it is typed where their cursor is; do not try to open the document through Drive or other connectors, and do not ask them to paste it.\n\n";
 
     static string Prompt(string request, bool question, bool widget)

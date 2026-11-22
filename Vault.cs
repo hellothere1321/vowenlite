@@ -23,8 +23,9 @@ static class Vault
     {
         public string Site { get; set; } = "";     // registrable domain (coarse key for cookies/expiry grouping)
         public string Host { get; set; } = "";      // the exact host the user typed (H2: logins only fill on this host + its www/bare pair)
+        public bool? Subdomains { get; set; }       // also fill on https subdomains of Host (an SSO page like logon.<school>.edu); null = old entry: on when Host is a bare registrable domain
         public string User { get; set; } = "";
-        public string Blob { get; set; }           // DPAPI ciphertext (base64) of "v1|<savedAtTicks>|<password>"; null once expired
+        public string Blob { get; set; }         // DPAPI ciphertext (base64) of "v1|<savedAtTicks>|<password>"; null once expired
         public string Salt { get; set; }           // per-entry entropy (base64)
         public DateTime SavedAt { get; set; }      // UTC; display/ordering hint only. Authoritative expiry = the SavedAt sealed INSIDE Blob.
         public bool Expired => Blob == null;
@@ -131,8 +132,24 @@ static class Vault
     public static bool EntryMatches(Entry e, string url)
     {
         if (e == null || !Uri.TryCreate(url, UriKind.Absolute, out var u) || u.Scheme != "https") return false;
-        return AllowedHosts(e).Contains(HostOf(u.Host));
+        string h = HostOf(u.Host);
+        if (AllowedHosts(e).Contains(h)) return true;
+        if (!Wide(e)) return false;
+        string b = BareOf(e);
+        return h.Length > b.Length + 1 && h.EndsWith("." + b, StringComparison.Ordinal);   // "school.example" -> logon.school.example; never school.example.evil.io or evilschool.example
     }
+
+    // A bare registrable domain that is not a shared-hosting / public suffix (github.io, vercel.app, co.uk ...) and not an IP: the only kind that may cover subdomains.
+    internal static bool IsBare(string host)
+    {
+        host = (host ?? "").ToLowerInvariant(); if (host.StartsWith("www.")) host = host.Substring(4);
+        if (host.Length == 0 || !host.Contains('.') || IPAddress.TryParse(host, out _) || PublicSuffix2.Contains(host)) return false;
+        var l = host.Split('.');
+        if (l.Length == 2 && l[1].Length == 2 && Second.Contains(l[0])) return false;   // co.uk
+        return Site(host) == host;
+    }
+    static string BareOf(Entry e) { string h = string.IsNullOrEmpty(e.Host) ? e.Site : e.Host; return h.StartsWith("www.") ? h.Substring(4) : h; }
+    internal static bool Wide(Entry e) => e != null && IsBare(BareOf(e)) && (e.Subdomains ?? true);
 
     public static string Mask(string user)
     {
@@ -159,11 +176,13 @@ static class Vault
 
     public static List<Entry> List() { Sweep(); return Locked(LoadEntries).OrderBy(e => e.Site).ToList(); }
 
-    public static string Save(string siteText, string user, string password)
+    public static string Save(string siteText, string user, string password, bool subdomains = false)
     {
         string site = Site(siteText), host = HostOf(siteText);
         if (site.Length == 0 || !site.Contains('.') || IPAddress.TryParse(site, out _)) return "Give the site as a web address, e.g. github.com.";
         if (host.Length == 0) host = site;
+        // "also fill on subdomains" covers the whole registrable domain (my.school.example -> school.example), but never a shared-hosting suffix (those stay exact)
+        if (subdomains && IsBare(site)) host = site; else subdomains = false;
         if (string.IsNullOrEmpty(password)) return "Type the password.";
         DateTime saved = Now();
         byte[] salt = RandomNumberGenerator.GetBytes(16);
@@ -175,7 +194,7 @@ static class Vault
         {
             var list = LoadEntries();
             list.RemoveAll(e => e.Site == site && string.Equals(e.User, user ?? "", StringComparison.OrdinalIgnoreCase));
-            list.Add(new Entry { Site = site, Host = host, User = user ?? "", Blob = blob, Salt = Convert.ToBase64String(salt), SavedAt = saved });
+            list.Add(new Entry { Site = site, Host = host, User = user ?? "", Blob = blob, Salt = Convert.ToBase64String(salt), SavedAt = saved, Subdomains = subdomains });
             SaveEntries(list);
             return 0;
         });
@@ -332,13 +351,25 @@ static class Vault
             Check("encoded secret scrubbed: " + scrubbed, !scrubbed.Contains(enc) && !scrubbed.Contains(pw));
 
             // H2: a saved entry fills only on the exact host it was typed for (+ the www/bare pair); not subdomains or look-alikes.
-            var gh = new Entry { Site = "github.com", Host = "github.com" };
+            var gh = new Entry { Site = "github.com", Host = "github.com", Subdomains = false };
             Check("exact host matches", Vault.EntryMatches(gh, "https://github.com/login"));
             Check("www pair matches", Vault.EntryMatches(gh, "https://www.github.com/login"));
             Check("subdomain gist.github.com refused", !Vault.EntryMatches(gh, "https://gist.github.com/login"));
             Check("look-alike github.com.evil.io refused", !Vault.EntryMatches(gh, "https://github.com.evil.io/login"));
             Check("userinfo github.com@evil.io refused", !Vault.EntryMatches(gh, "https://github.com@evil.io/login"));
             Check("http refused (entry)", !Vault.EntryMatches(gh, "http://github.com/login"));
+            var wide = new Entry { Site = "school.example", Host = "school.example", Subdomains = true };
+            Check("subdomain on: logon.school.example fills", Vault.EntryMatches(wide, "https://logon.school.example/adfs/ls"));
+            Check("subdomain on: deep a.b.school.example fills", Vault.EntryMatches(wide, "https://a.b.school.example/x"));
+            Check("subdomain on: bare + www still fill", Vault.EntryMatches(wide, "https://school.example/") && Vault.EntryMatches(wide, "https://www.school.example/"));
+            Check("subdomain on: look-alike school.example.evil.io refused", !Vault.EntryMatches(wide, "https://school.example.evil.io/") && !Vault.EntryMatches(wide, "https://logon.school.example.evil.io/"));
+            Check("subdomain on: evilschool.example refused", !Vault.EntryMatches(wide, "https://evilschool.example/"));
+            Check("subdomain on: http refused", !Vault.EntryMatches(wide, "http://logon.school.example/"));
+            Check("subdomain on: userinfo refused", !Vault.EntryMatches(wide, "https://logon.school.example@evil.io/"));
+            Check("old entry (no flag) on a bare domain migrates to on", Vault.EntryMatches(new Entry { Site = "school.example", Host = "school.example" }, "https://logon.school.example/"));
+            Check("host-specific old entry stays exact", !Vault.EntryMatches(new Entry { Site = "school.example", Host = "my.school.example" }, "https://logon.school.example/"));
+            Check("shared hosting never wide", !Vault.IsBare("github.io") && !Vault.IsBare("vercel.app") && !Vault.IsBare("co.uk") && !Vault.IsBare("127.0.0.1") && Vault.IsBare("school.example") && Vault.IsBare("www.school.example"));
+            Check("shared hosting entry with flag stays exact", !Vault.EntryMatches(new Entry { Site = "me.github.io", Host = "github.io", Subdomains = true }, "https://evil.github.io/"));
             var sub = new Entry { Site = "github.com", Host = "login.github.com" };
             Check("host-specific entry: bare domain refused", !Vault.EntryMatches(sub, "https://github.com/x") && Vault.EntryMatches(sub, "https://login.github.com/x"));
 

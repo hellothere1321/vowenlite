@@ -936,7 +936,9 @@ var __docs = () => { const out = [document]; for (let i = 0; i < out.length && o
         if (entry.Expired) return (3, $"the saved login for {site} expired (logins last 7 days): ask the user to re-enter it in the vault (\"open passwords\").");
         if (wiped) return (1, "the browser's saved sessions just reached the 7-day limit and were wiped, which reset the page: open the sign-in page again, then run `login`.");
         string eHost = string.IsNullOrEmpty(entry.Host) ? entry.Site : entry.Host;
-        if (!Vault.EntryMatches(entry, host.W.Source)) return (126, $"refused: the open page ({Trim(host.W.Source, 80)}) is not an https page on {eHost}. Open {eHost}'s own sign-in page first.");
+        // The saved login only fills on its own host (a sign-in on another host, e.g. a school's logon. subdomain, never gets the password), so put the
+        // window on the user's screen right away instead of leaving it to the model to remember `handoff` (it once told the user to click in the hidden browser).
+        if (!Vault.EntryMatches(entry, host.W.Source)) return StartHandoff($"The saved login only fills on {eHost}, and the open page ({Trim(host.W.Source, 80)}) is somewhere else, so the sign-in window is now open on the user's screen for them to sign in themselves. End your turn now without another tool call; VowenLite continues this request by itself once they're signed in.");
 
         // M1/M3: the whole fill runs here, start to finish; a throwaway tab holds the filled page so its history/BFCache and any
         // URL that gained the password (GET form / redirect) are destroyed when we close it, never reachable by a later command.

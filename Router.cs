@@ -107,6 +107,9 @@ static class Router
         }
 
         // open <target>
+        // "open a new tab in/on/to X", "open X in a new tab/window", "open a new tab and go to X": same as "open X" (a visible tab, not Codex's hidden browser)
+        r = Regex.Replace(r, @"^(" + OpenVerb + @")\s+(?:up\s+)?(?:a\s+)?new\s+(?:browser\s+)?(?:tab|window)\s+(?:and\s+(?:go|navigate)\s+)?(?:in|on|to|for|with)\s+", "$1 ", RegexOptions.IgnoreCase);
+        r = Regex.Replace(r, @"\s+(?:in|on|with)\s+(?:a\s+)?new\s+(?:browser\s+)?(?:tab|window)$", "", RegexOptions.IgnoreCase);
         if (!(m = OpenCmd.Match(r)).Success) return null;
         string t = m.Groups[1].Value.Trim().TrimEnd('.');
         if (t.Split(' ').Length > 5) return null;                         // "open the file I downloaded yesterday..." needs a model

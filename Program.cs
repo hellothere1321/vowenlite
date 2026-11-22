@@ -66,7 +66,7 @@ static class Program
         if (args.Length >= 2 && args[0] == "--shot")
         {
             int mx = Array.IndexOf(args, "--max");
-            return Shot.Capture(args[1], args.Contains("--screen"), mx > 0 && mx + 1 < args.Length && int.TryParse(args[mx + 1], out int mv) ? mv : 1800, args.Contains("--meta"));
+            return Shot.Capture(args[1], args.Contains("--screen"), mx > 0 && mx + 1 < args.Length && int.TryParse(args[mx + 1], out int mv) ? mv : 1800, args.Contains("--meta"), args.Contains("--circle"));
         }
         if (args.Length == 2 && args[0] == "--routetest") { Console.WriteLine(Luna.RouteTest(args[1])); return 0; }
         if (args.Length == 2 && args[0] == "--humantest") { Console.WriteLine(Humanize.Clean(args[1].Replace("\\n", "\n"), out int hc)); Console.WriteLine("(" + hc + " changes)"); return 0; }
